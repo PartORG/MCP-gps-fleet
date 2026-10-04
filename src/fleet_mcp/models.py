@@ -81,4 +81,6 @@ class KnowledgeChunk(BaseModel):
     title: str
     section: str = Field(description="Section heading inside the document ('' = whole document)")
     text: str
-    score: float = Field(description="Cosine similarity to the query, 0..1, higher = more relevant")
+    score: float = Field(
+        description="Relevance score (rank fusion of meaning + keyword search), higher = better"
+    )

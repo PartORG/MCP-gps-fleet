@@ -8,7 +8,7 @@ knowledge base of guides and past incident reports searched with RAG.
 ```text
                                         ┌─> db.py  (read-only SQL)          ──> data/fleet.db   facts
 Claude ──MCP──> server.py (9 tools) ────┤
-                                        └─> rag.py (Ollama embeddings + KNN) ─> data/kb.db      knowledge
+                                        └─> rag.py (vectors + keywords)     ──> data/kb.db     knowledge
 ```
 
 Structured facts ("where is FM-0977, how fast was it?") come from SQL;
@@ -21,7 +21,8 @@ comes from the knowledge base in `kb/`.
 uv sync
 ollama pull nomic-embed-text   # local embedding model (once); Ollama must be running
 uv run fleet-seed              # (re)creates data/fleet.db, ~10k telemetry rows ending "now"
-uv run fleet-ingest            # embeds kb/*.md into data/kb.db (re-run after editing kb/)
+uv run fleet-ingest            # indexes kb/*.md into data/kb.db (re-run after editing kb/)
+uv run fleet-eval              # retrieval quality per search mode (see "Search quality")
 uv run pytest                  # RAG tests are skipped if Ollama is not running
 ```
 
@@ -80,6 +81,28 @@ claude mcp add --transport http fleet-http http://127.0.0.1:8000/mcp
 npx @modelcontextprotocol/inspector uv run fleet-mcp   # MCP Inspector in the browser (needs Node)
 ```
 
+## Search quality
+
+The knowledge-base search is **hybrid**: a vector search (meaning, via Ollama
+embeddings + sqlite-vec) and a keyword search (SQLite FTS5, BM25) each return 20
+candidates, and Reciprocal Rank Fusion merges the two rankings.  Vectors handle
+paraphrases, keywords handle exact tokens like plates, incident numbers and
+"561/2006".
+
+`uv run fleet-eval` scores every mode on the 22 questions in
+`tests/eval_questions.json` (written before tuning, in user words) and prints the
+rank of the right document per question.  Current results:
+
+| mode | hit@1 | hit@3 | hit@5 | MRR |
+|---|---|---|---|---|
+| vector (v2) | 0.82 | 0.91 | 0.95 | 0.87 |
+| keyword | 0.82 | 0.95 | 1.00 | 0.90 |
+| **hybrid** (used by the tools) | 0.82 | **1.00** | 1.00 | **0.91** |
+
+hit@k = share of questions with the right document in the top k; MRR = mean of
+1/rank.  With 22 questions one question is ~4.5 points, so read these as a
+direction.  `pytest` fails if hybrid drops below hit@3 0.95 or below vector MRR.
+
 ## Layout
 
 | File | What it does |
@@ -88,7 +111,9 @@ npx @modelcontextprotocol/inspector uv run fleet-mcp   # MCP Inspector in the br
 | `src/fleet_mcp/seed.py` | Synthetic data generator + anomaly injection |
 | `src/fleet_mcp/db.py` | Read-only connection and every SQL query |
 | `src/fleet_mcp/models.py` | Pydantic models = the tools' output schemas |
-| `src/fleet_mcp/rag.py` | Chunking, Ollama embeddings, sqlite-vec index and search |
+| `src/fleet_mcp/rag.py` | Chunking, Ollama embeddings, vector + FTS5 index, hybrid search |
+| `src/fleet_mcp/rag_eval.py` | Retrieval eval (`fleet-eval`) |
+| `tests/eval_questions.json` | Eval questions with their expected documents |
 | `src/fleet_mcp/server.py` | The MCP tools |
 | `src/fleet_mcp/chat.py` | Offline Pydantic AI client (`fleet-chat`) |
 | `Modelfile` | `fleet-qwen3`: qwen3:8b with a bigger context window |
@@ -112,4 +137,4 @@ npx @modelcontextprotocol/inspector uv run fleet-mcp   # MCP Inspector in the br
 ## Roadmap
 
 v1 database + tools → v1.5 stdio/HTTP transports → v2 RAG over `kb/` → v3 Pydantic AI offline client
-(qwen3:8b) (this) → v4 hybrid search + eval → v5 flashrank reranking → v6 deployment (auth, Docker, health probes).
+(qwen3:8b) → v4 hybrid search + eval (this) → v5 flashrank reranking → v6 deployment (auth, Docker, health probes).

@@ -5,13 +5,15 @@ nomic-embed-text; without it those tests are SKIPPED (shown as 's'), not failed.
 """
 
 import asyncio
-from pathlib import Path
+import json
+import shutil
+from contextlib import closing
 
 import httpx
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
-from fleet_mcp import rag
+from fleet_mcp import rag, rag_eval
 from fleet_mcp.server import mcp
 
 
@@ -64,55 +66,28 @@ def kb(kb_path, monkeypatch):
     monkeypatch.setattr(rag, "KB_PATH", kb_path)  # the tools use rag.KB_PATH
 
 
-# A tiny golden set: (question, file that must be among the top 3).
-# v4 turns this into a measured eval (recall@k) to compare vector vs. hybrid search.
-GOLDEN = [
-    (
-        "search_similar_incidents",
-        "fuel level fell overnight at a truck stop, ignition off",
-        "incident_1433.md",
-    ),
-    (
-        "search_similar_incidents",
-        "fuel level dropped and an hour later was back without refuelling",
-        "incident_1519.md",
-    ),
-    (
-        "search_similar_incidents",
-        "position froze while the truck kept driving, always the same driver",
-        "incident_1650.md",
-    ),
-    pytest.param(
-        "search_similar_incidents",
-        "many vehicles all over Germany had GPS jumps at the same time",
-        "incident_1977.md",
-        # Known miss of vector-only search: ranks 5th, all GPS incidents score within 0.05,
-        # because the embedding captures "GPS jump" but not "many vehicles at once".
-        # strict=True: when v4/v5 fix it, this XPASS fails the run -> remove the marker.
-        marks=pytest.mark.xfail(strict=True, reason="vector-only search ranks it 5th; target for v4/v5"),
-    ),
-    (
-        "search_similar_incidents",
-        "engine running for an hour at deliveries to keep the cargo cold",
-        "incident_1600.md",
-    ),
-    ("search_fleet_knowledge", "what is the motorway speed limit for trucks", "fleet_safety.md"),
-    ("search_fleet_knowledge", "how can I tell fuel theft from a leak", "fuel_anomalies.md"),
-    ("search_fleet_knowledge", "what does the maintenance status mean", "vehicle_statuses.md"),
-    (
-        "search_fleet_knowledge",
-        "how long must a truck driver rest after 4.5 hours of driving",
-        "driver_behavior.md",
-    ),
-]
+@requires_ollama
+def test_retrieval_quality_gate(kb_path):
+    """Regression gate on the eval set (tests/eval_questions.json, see rag_eval.py).
+
+    Thresholds sit just below the measured v4 numbers (hybrid hit@3 = 1.00, MRR 0.91;
+    vector MRR 0.87), so a change that makes retrieval worse fails here.  Run
+    `uv run fleet-eval` for the full per-question table.
+    """
+    questions = json.loads(rag_eval.QUESTIONS.read_text())
+    with closing(rag.connect(kb_path)) as conn:
+        hybrid = rag_eval.metrics(rag_eval.ranks(conn, "hybrid", questions))
+        vector = rag_eval.metrics(rag_eval.ranks(conn, "vector", questions))
+    assert hybrid["hit@3"] >= 0.95  # at most one question may fall out of the top 3
+    assert hybrid["MRR"] >= vector["MRR"]  # the reason hybrid exists
 
 
 @requires_ollama
-@pytest.mark.parametrize(("tool", "question", "expected"), GOLDEN)
-def test_retrieval_finds_expected_document(kb, tool, question, expected):
-    arg = "description" if tool == "search_similar_incidents" else "query"
-    results = call(tool, **{arg: question, "limit": 3}).structured_content["result"]
-    assert expected in [Path(r["source"]).name for r in results]
+def test_keyword_search_survives_fts_syntax(kb_path):
+    """FTS5 has its own query language; user text with quotes/operators must not break it."""
+    with closing(rag.connect(kb_path)) as conn:
+        for query in ['fuel fell 24 % ("theft")', "NOT * OR AND", "speed-limit: 130?", "!!!"]:
+            rag.search(conn, query, None, 3, "keyword")  # must not raise
 
 
 @requires_ollama
@@ -129,4 +104,16 @@ def test_tools_only_return_their_kind(kb):
 def test_ollama_down_is_a_tool_error(kb, monkeypatch):
     monkeypatch.setattr(rag, "OLLAMA_URL", "http://127.0.0.1:9")  # nothing listens on port 9
     with pytest.raises(ToolError, match="ollama serve"):
+        call("search_fleet_knowledge", query="speed limit")
+
+
+@requires_ollama
+def test_outdated_index_is_a_tool_error(kb_path, tmp_path, monkeypatch):
+    """An index built before v4 has no keyword table: tell the user to re-ingest."""
+    old = tmp_path / "kb.db"
+    shutil.copy(kb_path, old)
+    with closing(rag.connect(old, readonly=False)) as conn:
+        conn.execute("DROP TABLE chunks_fts")
+    monkeypatch.setattr(rag, "KB_PATH", old)
+    with pytest.raises(ToolError, match="outdated.*fleet-ingest"):
         call("search_fleet_knowledge", query="speed limit")

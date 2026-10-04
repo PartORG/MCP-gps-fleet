@@ -27,6 +27,7 @@ the traceback.
 """
 
 import os
+import sqlite3
 import sys
 from contextlib import closing
 from datetime import datetime
@@ -183,6 +184,8 @@ def _search(query: str, kind: str | None, limit: int) -> list[KnowledgeChunk]:
             f"The embedding service (Ollama at {rag.OLLAMA_URL}, model {rag.EMBED_MODEL}) failed: {e}. "
             "Is `ollama serve` running?"
         ) from e
+    except sqlite3.OperationalError as e:  # e.g. "no such table: chunks_fts" in a pre-v4 index
+        raise ToolError(f"The knowledge base index is outdated ({e}). Run `uv run fleet-ingest`.") from e
 
 
 @mcp.tool(annotations=READ_ONLY)

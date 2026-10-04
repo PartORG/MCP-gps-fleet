@@ -1,18 +1,24 @@
-"""RAG: the fleet knowledge base (kb/*.md) turned into a searchable vector index.
+"""RAG: the fleet knowledge base (kb/*.md) turned into a searchable index (vectors + keywords).
 
 Run:  uv run fleet-ingest      (re-run whenever a file in kb/ changes)
 
 The two halves
 --------------
-INGEST (offline, once)                       SEARCH (per tool call)
+INGEST (offline, once)                       SEARCH (per tool call, "hybrid")
   kb/**/*.md                                   question from the LLM
-    └─ split_markdown(): one chunk per           └─ embed() with the "search_query: " prefix
-       "## section" (guides) or per file            └─ sqlite-vec KNN: the k nearest chunk
-       (incident reports)                              vectors by cosine distance
-    └─ embed() each chunk via Ollama                └─ join back to the chunk text
-       (nomic-embed-text, 768 numbers)                 └─ list[KnowledgeChunk] to the LLM
-    └─ store text in `chunks`,
-       vectors in `chunk_vectors` (data/kb.db)
+    └─ split_markdown(): one chunk per           ├─ vector:  embed() the question, sqlite-vec
+       "## section" (guides) or per file         │           KNN -> 20 chunks closest in MEANING
+       (incident reports)                        ├─ keyword: FTS5 full-text search, BM25 ranking
+    └─ embed() each chunk via Ollama             │           -> 20 chunks sharing the most WORDS
+       (nomic-embed-text, 768 numbers)           └─ fuse both rankings (RRF), keep the top `limit`
+    └─ store text in `chunks`,                      └─ list[KnowledgeChunk] to the LLM
+       vectors in `chunk_vectors`,
+       words in `chunks_fts` (data/kb.db)
+
+Why both?  They fail differently.  Vectors understand paraphrases ("fuel paid with the
+company card never showed up in the tank") but blur exact tokens: plates, incident
+numbers, "561/2006".  Keywords nail exact tokens but miss paraphrases.  Measure the
+difference with `uv run fleet-eval` (rag_eval.py).
 
 Why a separate data/kb.db and not fleet.db?  `fleet-seed` deletes and rebuilds
 fleet.db whenever the synthetic data gets old; the knowledge base only changes
@@ -24,6 +30,7 @@ are only how we find the relevant text.
 
 import os
 import re
+from collections import defaultdict
 from pathlib import Path
 from typing import Literal, NamedTuple
 
@@ -60,7 +67,24 @@ CREATE VIRTUAL TABLE chunk_vectors USING vec0(
     embedding float[{EMBED_DIM}] distance_metric=cosine,
     kind text
 );
+-- FTS5 full-text index over chunks.text (built into SQLite, no extension needed).
+--   content='chunks'  : "external content" table, the text is not stored twice;
+--                       FTS5 reads it from `chunks` and only keeps its word index
+--   porter unicode61  : lowercase, split on non-alphanumerics, and reduce English words
+--                       to their stem, so "jumps" / "jumped" / "jump" all match
+CREATE VIRTUAL TABLE chunks_fts USING fts5(
+    text, content='chunks', content_rowid='id', tokenize='porter unicode61'
+);
 """
+
+# Each retriever returns this many candidates before fusion; more than `limit`, so a
+# chunk ranked 8th by one retriever and 2nd by the other can still win.
+CANDIDATES = 20
+# Reciprocal Rank Fusion constant (Cormack et al., 2009; 60 is the usual value).
+# A chunk's fused score is the sum over retrievers of 1 / (RRF_K + its rank there).
+# The larger the constant, the less a single #1 rank dominates over agreement.
+RRF_K = 60
+Mode = Literal["vector", "keyword", "hybrid"]
 
 
 class Chunk(NamedTuple):
@@ -147,33 +171,77 @@ def ingest(kb_dir: Path, path: Path) -> int:
                 # sqlite-vec stores vectors as packed 32-bit floats
                 (i, sqlite_vec.serialize_float32(vector), chunk.kind),
             )
+        # External-content FTS5 tables are filled by this special command: (re)index
+        # every row of `chunks` in one go.
+        conn.execute("INSERT INTO chunks_fts (chunks_fts) VALUES ('rebuild')")
     conn.close()
     return len(chunks)
 
 
-def search(conn, query: str, kind: str | None, limit: int) -> list[KnowledgeChunk]:
-    """The `limit` chunks closest in meaning to `query`, best first; `kind` filters guide/incident."""
+def search(conn, query: str, kind: str | None, limit: int, mode: Mode = "hybrid") -> list[KnowledgeChunk]:
+    """The `limit` most relevant chunks for `query`, best first; `kind` filters guide/incident.
+
+    `mode` exists for the eval (comparing retrievers); the MCP tools always use "hybrid".
+    """
+    rankings = []  # one list of chunk ids per retriever, best first
+    if mode in ("vector", "hybrid"):
+        rankings.append(_vector_ranking(conn, query, kind))
+    if mode in ("keyword", "hybrid"):
+        rankings.append(_keyword_ranking(conn, query, kind))
+
+    # Reciprocal Rank Fusion: only the RANK in each list counts, not the raw scores.
+    # That is why it can combine cosine distances and BM25 scores, which are on
+    # completely different scales.  With a single retriever it keeps that order.
+    scores: dict[int, float] = defaultdict(float)
+    for ranking in rankings:
+        for rank, chunk_id in enumerate(ranking, start=1):
+            scores[chunk_id] += 1 / (RRF_K + rank)
+    best = sorted(scores, key=scores.__getitem__, reverse=True)[:limit]
+
+    rows = conn.execute(
+        f"SELECT id, source, kind, title, section, text FROM chunks WHERE id IN ({','.join('?' * len(best))})",
+        best,  # the placeholders are generated, the values are bound: no user text in the SQL
+    ).fetchall()
+    by_id = {r["id"]: r for r in rows}
+    return [
+        KnowledgeChunk(**{k: by_id[i][k] for k in Chunk._fields}, score=round(scores[i], 4)) for i in best
+    ]
+
+
+def _vector_ranking(conn, query: str, kind: str | None) -> list[int]:
+    """Chunk ids closest in meaning to `query` (cosine distance of embeddings)."""
     [vector] = embed([query], query=True)
-    # KNN syntax of sqlite-vec: `embedding MATCH <vector> AND k = <n>` returns the
-    # n nearest rows with a `distance` column.  It runs in the CTE on its own, then
-    # we join the text.  The optional filter is one of two fixed strings, never user input.
+    # KNN syntax of sqlite-vec: `embedding MATCH <vector> AND k = <n>` returns the n
+    # nearest rows, nearest first.  The optional filter is a fixed string, never user input.
     kind_filter = "AND kind = :kind" if kind else ""
     rows = conn.execute(
-        f"""
-        WITH nearest AS (
-            SELECT rowid, distance FROM chunk_vectors
-            WHERE embedding MATCH :vector AND k = :k {kind_filter}
-        )
-        SELECT c.source, c.kind, c.title, c.section, c.text, nearest.distance
-        FROM nearest JOIN chunks c ON c.id = nearest.rowid
-        ORDER BY nearest.distance
-        """,
-        {"vector": sqlite_vec.serialize_float32(vector), "k": limit, "kind": kind},
+        f"SELECT rowid FROM chunk_vectors WHERE embedding MATCH :vector AND k = :k {kind_filter} ORDER BY distance",
+        {"vector": sqlite_vec.serialize_float32(vector), "k": CANDIDATES, "kind": kind},
     ).fetchall()
-    # cosine distance = 1 - cosine similarity; similarity reads more naturally as a score
-    return [
-        KnowledgeChunk(**{k: r[k] for k in Chunk._fields}, score=round(1 - r["distance"], 3)) for r in rows
-    ]
+    return [r[0] for r in rows]
+
+
+def _keyword_ranking(conn, query: str, kind: str | None) -> list[int]:
+    """Chunk ids sharing the most (rare) words with `query`, by FTS5's BM25 ranking."""
+    # FTS5 has its own query language (AND, NOT, quotes, *, ...), so passing the raw
+    # question could be a syntax error ("24 %") or change the meaning.  Instead: keep
+    # only the words, quote each one, and OR them, i.e. "match any of these words".
+    # BM25 then ranks chunks higher for rarer words, so "the" barely counts and
+    # "0550" counts a lot.  Words are [a-zA-Z0-9_] runs, so they cannot contain quotes.
+    words = re.findall(r"\w+", query)
+    if not words:
+        return []
+    kind_filter = "AND c.kind = :kind" if kind else ""
+    rows = conn.execute(
+        f"""
+        SELECT c.id FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.rowid
+        WHERE chunks_fts MATCH :match {kind_filter}
+        ORDER BY chunks_fts.rank   -- rank = BM25; lower is better
+        LIMIT :n
+        """,
+        {"match": " OR ".join(f'"{w}"' for w in words), "kind": kind, "n": CANDIDATES},
+    ).fetchall()
+    return [r[0] for r in rows]
 
 
 def main() -> None:
