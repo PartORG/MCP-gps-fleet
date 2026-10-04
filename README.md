@@ -101,6 +101,23 @@ A run passes with all three.  Missing model variants are created automatically
 (`ollama pull` the base model first, e.g. `ollama pull qwen3:4b`).  Pass variant
 names to run a subset: `uv run fleet-agent-eval qwen3:4b llama3.2:3b`.
 
+Results (RTX 4070 Laptop, 8 GB; one run per question, so small differences are noise):
+
+| model | passed | right tools | all facts | invented plates | median time | peak context |
+|---|---|---|---|---|---|---|
+| qwen3:8b (default) | 6/6 | 6/6 | 6/6 | 0 | 38 s | 4.2k |
+| qwen3:8b, thinking off | 5/6 | 6/6 | 5/6 | 0 | 26 s | 2.8k |
+| qwen3:4b | 6/6 | 6/6 | 6/6 | 0 | 34 s | 9.2k |
+| llama3.2:3b | 3/6 | 4/6 | 4/6 | 0 | 2 s | 3.4k |
+
+- **qwen3:4b matches qwen3:8b** on these questions at half the memory (fits fully on
+  the GPU), but it used the most context (9.2k of 12k).
+- **Thinking off is ~30% faster** but missed "fastest in the last 7 days": it
+  reported the *newest* speeding alert (FM-0788, 164 km/h) instead of the fastest
+  sample (FM-0862, 174.7 km/h).
+- **llama3.2:3b is ~20x faster but unreliable**: same newest-vs-fastest mix-up,
+  skipped the knowledge-base search, and gave up after a failed tool call.
+
 ## Deployment
 
 The HTTP server has two unauthenticated endpoints for orchestrators: `/healthz`
