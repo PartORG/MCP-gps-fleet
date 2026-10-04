@@ -19,10 +19,10 @@ comes from the knowledge base in `kb/`.
 
 ```bash
 uv sync
-ollama pull nomic-embed-text   # local embedding model (once); Ollama must be running
 uv run fleet-seed              # (re)creates data/fleet.db, ~10k telemetry rows ending "now"
 uv run fleet-ingest            # indexes kb/*.md into data/kb.db (re-run after editing kb/);
-                               # first run also downloads the reranker model (~22 MB)
+                               # Ollama must be running; the first run pulls the embedding
+                               # model into it and downloads the reranker model (~22 MB)
 uv run fleet-eval              # retrieval quality per search mode (see "Search quality")
 uv run pytest                  # RAG tests are skipped if Ollama is not running
 ```
@@ -59,9 +59,11 @@ Same server, same tools; environment variables pick how clients reach it.
 | Variable | Default | Meaning |
 |---|---|---|
 | `FLEET_TRANSPORT` | `stdio` | `stdio`: the client starts the server (Claude Code via `.mcp.json`). `http`: a long-running server at `http://<host>:<port>/mcp` (Streamable HTTP) |
-| `FLEET_HOST` | `127.0.0.1` | Only `127.0.0.1`, `localhost` or `::1` until auth exists (v6) |
+| `FLEET_HOST` | `127.0.0.1` | Any other address (e.g. `0.0.0.0`) requires `FLEET_API_TOKEN` |
+| `FLEET_API_TOKEN` | *(unset)* | HTTP: require `Authorization: Bearer <token>` (min. 32 chars); `fleet-chat` sends it too |
 | `FLEET_PORT` | `8000` | HTTP port |
 | `FLEET_DB` | `data/fleet.db` | Fleet database file |
+| `FLEET_MODELS_DIR` | `data/models` | Where the reranker model is stored |
 | `FLEET_KB_DB` | `data/kb.db` | Knowledge-base index file |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama: embeddings, and the `fleet-chat` model |
 | `FLEET_CHAT_MODEL` | `fleet-qwen3` | `fleet-chat` only: Ollama model to chat with |
@@ -74,6 +76,7 @@ uv run --env-file .env fleet-mcp
 
 # connect Claude Code to the running HTTP server:
 claude mcp add --transport http fleet-http http://127.0.0.1:8000/mcp
+# with a token:  ... --header "Authorization: Bearer $FLEET_API_TOKEN"
 ```
 
 ### Inspect it by hand
@@ -81,6 +84,44 @@ claude mcp add --transport http fleet-http http://127.0.0.1:8000/mcp
 ```bash
 npx @modelcontextprotocol/inspector uv run fleet-mcp   # MCP Inspector in the browser (needs Node)
 ```
+
+## Deployment
+
+The HTTP server has two unauthenticated endpoints for orchestrators: `/healthz`
+(liveness: the process answers) and `/readyz` (readiness: both databases exist; 503
+otherwise).  Everything else needs the bearer token once `FLEET_API_TOKEN` is set,
+and it must be set for any non-localhost address.
+
+**Docker Compose** (Ollama + fleet-mcp, like production):
+
+```bash
+echo "FLEET_API_TOKEN=$(openssl rand -hex 32)" > .env
+docker compose up --build        # MCP at http://127.0.0.1:8000/mcp, ready after ~1 min
+```
+
+The container seeds fresh data and builds the index at start (pulling the embedding
+model into Ollama the first time); the reranker model is baked into the image.
+
+**Kubernetes (Helm)**: chart in `charts/fleet-mcp`, image published by CI to
+`ghcr.io/partorg/mcp-gps-fleet`.
+
+```bash
+kubectl create namespace fleet-mcp
+kubectl -n fleet-mcp create secret generic fleet-mcp-token --from-literal=token=$(openssl rand -hex 32)
+helm install fleet charts/fleet-mcp -n fleet-mcp
+kubectl -n fleet-mcp port-forward svc/fleet 8000:8000
+```
+
+An init container seeds the data and builds the index (retried by Kubernetes until
+Ollama is up); the server runs non-root on a read-only root filesystem with
+liveness/readiness probes and resource requests/limits measured under load
+(~400 MiB fleet-mcp, ~450 MiB Ollama).  Deliberate limits: one replica (MCP sessions
+live in process memory), one shared token (switch to the SDK's OAuth support for
+per-user access), and `emptyDir` volumes (a new pod reseeds; Ollama re-pulls 274 MB).
+To use an existing Ollama: `--set ollama.enabled=false --set ollama.url=http://...`.
+
+**CI** (`.github/workflows/ci.yml`): ruff, pytest (RAG quality tests skip without
+Ollama), `helm lint`, and the image build; pushes to `master` publish the image.
 
 ## Search quality
 
@@ -125,6 +166,9 @@ an LLM tool call.  `pytest` fails if the rerank mode drops below hit@1 0.9 / hit
 | `src/fleet_mcp/server.py` | The MCP tools |
 | `src/fleet_mcp/chat.py` | Offline Pydantic AI client (`fleet-chat`) |
 | `Modelfile` | `fleet-qwen3`: qwen3:8b with a bigger context window |
+| `Dockerfile`, `compose.yaml` | Server image; local stack with Ollama |
+| `charts/fleet-mcp/` | Helm chart (fleet-mcp + Ollama) |
+| `.github/workflows/ci.yml` | Lint, tests, Helm lint, image publish |
 | `kb/*.md` | Guides and policies (one search chunk per `##` section) |
 | `kb/incidents/*.md` | Past incident reports (one chunk per report) |
 
@@ -145,4 +189,4 @@ an LLM tool call.  `pytest` fails if the rerank mode drops below hit@1 0.9 / hit
 ## Roadmap
 
 v1 database + tools → v1.5 stdio/HTTP transports → v2 RAG over `kb/` → v3 Pydantic AI offline client
-(qwen3:8b) → v4 hybrid search + eval → v5 flashrank reranking (this) → v6 deployment (auth, Docker, health probes).
+(qwen3:8b) → v4 hybrid search + eval → v5 flashrank reranking → v6 deployment: auth, Docker, Helm, CI (this).

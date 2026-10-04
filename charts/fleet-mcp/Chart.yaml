@@ -1,0 +1,6 @@
+apiVersion: v2
+name: fleet-mcp
+description: Fleet MCP server (synthetic fleet data + RAG knowledge base) with an Ollama for embeddings
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

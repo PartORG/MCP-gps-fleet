@@ -1,0 +1,99 @@
+{{- /*
+fleet-mcp: an init container prepares the data, then the server runs.
+
+  init "prepare-data": fleet-seed (synthetic fleet ending "now") + fleet-ingest (needs
+      Ollama; pulls the embedding model on first use).  If Ollama isn't reachable yet it
+      fails and Kubernetes retries it with backoff: no wait loop needed.
+  main "fleet-mcp": serves http://<svc>:8000/mcp with a bearer token; probes on
+      /healthz (liveness) and /readyz (readiness), both reachable without the token.
+
+The data lives in an emptyDir, so every new pod reseeds fresh data.  The synthetic data
+ages: `kubectl rollout restart deployment/<release>` gives a fresh week of data.
+*/ -}}
+{{- /* if/else, not `ternary`: ternary evaluates both sides, so `required` would always fire */ -}}
+{{- $ollamaUrl := "" }}
+{{- if .Values.ollama.enabled }}
+{{- $ollamaUrl = printf "http://%s-ollama:11434" .Release.Name }}
+{{- else }}
+{{- $ollamaUrl = required "ollama.url is required when ollama.enabled is false" .Values.ollama.url }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}
+  labels: &labels
+    app.kubernetes.io/name: fleet-mcp
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  # ponytail: one replica; Streamable HTTP sessions live in process memory, so more
+  # replicas need sticky sessions (or the SDK's stateless_http mode).
+  replicas: 1
+  selector:
+    matchLabels: *labels
+  template:
+    metadata:
+      labels: *labels
+    spec:
+      # Kubernetes injects legacy Docker-link env vars for every Service in the namespace:
+      # a Service named "fleet" yields FLEET_PORT=tcp://10.43.x.x:8000, which collides with
+      # our own FLEET_PORT setting (seen in the first k3s deploy).  Off = only our env vars.
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001 # the `app` user created in the Dockerfile
+        fsGroup: 10001 # makes the emptyDir volumes writable for that user
+      initContainers:
+        - name: prepare-data
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["sh", "-c", "fleet-seed && fleet-ingest"]
+          env:
+            - { name: OLLAMA_URL, value: {{ $ollamaUrl | quote }} }
+          volumeMounts: &mounts
+            - { name: data, mountPath: /app/data }
+            - { name: tmp, mountPath: /tmp }
+          securityContext: &containerSecurity
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true # only the mounted volumes are writable
+            capabilities: { drop: [ALL] }
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+      containers:
+        - name: fleet-mcp
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - { name: http, containerPort: 8000 }
+          env:
+            - { name: OLLAMA_URL, value: {{ $ollamaUrl | quote }} }
+            - name: FLEET_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "auth.existingSecret is required (see values.yaml)" .Values.auth.existingSecret }}
+                  key: token
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          volumeMounts: *mounts
+          securityContext: *containerSecurity
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - { name: data, emptyDir: {} }
+        - { name: tmp, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}
+  labels:
+    app.kubernetes.io/name: fleet-mcp
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  selector:
+    app.kubernetes.io/name: fleet-mcp
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - { name: http, port: {{ .Values.service.port }}, targetPort: http }

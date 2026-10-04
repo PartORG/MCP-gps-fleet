@@ -19,6 +19,7 @@ Transport (same switch idea as the server):
     default               stdio: the agent starts `fleet-mcp` itself, using the command in .mcp.json
     FLEET_MCP_URL=<url>   HTTP: connect to a server already running with FLEET_TRANSPORT=http,
                           e.g. FLEET_MCP_URL=http://127.0.0.1:8000/mcp
+    FLEET_API_TOKEN=<t>   sent as `Authorization: Bearer <t>` to a token-protected HTTP server
 """
 
 import asyncio
@@ -60,8 +61,11 @@ INSTRUCTIONS = (
 
 
 def build_agent() -> Agent:
+    headers = None
     if url := os.environ.get("FLEET_MCP_URL"):
         transport = url  # MCPToolset builds a Streamable HTTP client from a URL
+        if token := os.environ.get("FLEET_API_TOKEN"):
+            headers = {"Authorization": f"Bearer {token}"}
     else:
         # Reuse Claude Code's config, so there is one place that says how to start the server.
         server = json.loads((ROOT / ".mcp.json").read_text())["mcpServers"]["fleet"]
@@ -77,7 +81,7 @@ def build_agent() -> Agent:
 
     # include_instructions=True: pass the server's `instructions` (tool overview and flow) to
     # the model. Off by default in Pydantic AI; Claude Code always reads them.
-    fleet = MCPToolset(transport, include_instructions=True)
+    fleet = MCPToolset(transport, include_instructions=True, headers=headers)
     # Ollama speaks the OpenAI chat API under /v1, which is what OllamaModel talks to.
     model = OllamaModel(CHAT_MODEL, provider=OllamaProvider(base_url=f"{OLLAMA_URL}/v1"))
     return Agent(model, toolsets=[fleet], instructions=INSTRUCTIONS)

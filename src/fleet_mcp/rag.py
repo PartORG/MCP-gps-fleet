@@ -91,9 +91,10 @@ RRF_K = 60
 # computed vectors, but too slow to run over the whole kb, so it only re-orders the hybrid
 # top CANDIDATES.  flashrank runs it with onnxruntime on the CPU (~150 MB installed, no
 # PyTorch).  MiniLM-L-12 (~34 MB) is flashrank's best small English model.  The model
-# goes to data/models (flashrank's default /tmp is wiped on reboot and would re-download).
+# goes to data/models (flashrank's default /tmp is wiped on reboot and would re-download);
+# the Docker image bakes it into /app/models via FLEET_MODELS_DIR, outside the data volume.
 RERANK_MODEL = "ms-marco-MiniLM-L-12-v2"
-MODELS_DIR = ROOT / "data" / "models"
+MODELS_DIR = Path(os.environ.get("FLEET_MODELS_DIR", ROOT / "data" / "models"))
 
 # vector / keyword: one retriever.  hybrid: both, fused.  rerank: hybrid + reranker.
 Mode = Literal["vector", "keyword", "hybrid", "rerank"]
@@ -150,6 +151,20 @@ def embed(texts: list[str], *, query: bool) -> list[list[float]]:
     return response.json()["embeddings"]
 
 
+def ensure_embed_model() -> None:
+    """Pull the embedding model into Ollama if it isn't there yet (a fresh container is empty).
+
+    Asks Ollama locally first (/api/show) and only downloads on a 404, so re-ingesting
+    works offline once the model is present.
+    """
+    if httpx.post(f"{OLLAMA_URL}/api/show", json={"model": EMBED_MODEL}, timeout=10).status_code == 404:
+        print(f"Pulling {EMBED_MODEL} into Ollama at {OLLAMA_URL} (~274 MB, once)...")
+        # stream=False: one response when the download is complete, instead of progress lines
+        httpx.post(
+            f"{OLLAMA_URL}/api/pull", json={"model": EMBED_MODEL, "stream": False}, timeout=900
+        ).raise_for_status()
+
+
 def connect(path: Path | None = None, *, readonly: bool = True):
     """Open the kb database with the sqlite-vec extension loaded."""
     conn = db.connect(path or KB_PATH, readonly=readonly)
@@ -167,6 +182,7 @@ def ingest(kb_dir: Path, path: Path) -> int:
         for file in sorted(kb_dir.rglob("*.md"))
         for chunk in split_markdown(file.relative_to(kb_dir).as_posix(), file.read_text())
     ]
+    ensure_embed_model()
     # Embed BEFORE touching the old index: if Ollama is down, the old index survives.
     # ponytail: one request for all chunks; batch it if the kb grows to thousands of chunks.
     vectors = embed([c.text for c in chunks], query=False)

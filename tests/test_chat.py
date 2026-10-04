@@ -12,7 +12,7 @@ from contextlib import closing
 import pytest
 from pydantic_ai.messages import ToolReturnPart
 from pydantic_ai.models.test import TestModel
-from test_db import http_server
+from test_db import TOKEN, http_server
 
 from fleet_mcp import chat, db, seed
 
@@ -52,4 +52,13 @@ def test_http_agent(other_db, monkeypatch):
     path, expected = other_db
     with http_server(path) as url:
         monkeypatch.setenv("FLEET_MCP_URL", url)
+        assert fleet_statistics_via_agent() == expected
+
+
+def test_http_agent_with_token(other_db, monkeypatch):
+    """fleet-chat sends FLEET_API_TOKEN to a token-protected server (e.g. the k8s deployment)."""
+    path, expected = other_db
+    with http_server(path, FLEET_API_TOKEN=TOKEN) as url:
+        monkeypatch.setenv("FLEET_MCP_URL", url)
+        monkeypatch.setenv("FLEET_API_TOKEN", TOKEN)
         assert fleet_statistics_via_agent() == expected

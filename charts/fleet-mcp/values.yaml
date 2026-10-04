@@ -1,0 +1,30 @@
+# Image of the fleet-mcp server (built from the repo's Dockerfile).
+image:
+  repository: ghcr.io/partorg/mcp-gps-fleet
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# The API token is never put in values (they end up in git); the chart reads it from a
+# Secret you create first, with the token under the key `token`:
+#   kubectl create secret generic fleet-mcp-token --from-literal=token=$(openssl rand -hex 32)
+auth:
+  existingSecret: fleet-mcp-token
+
+service:
+  port: 8000
+
+# Measured under load: ~400 MiB once the reranker model is loaded, near-zero idle CPU;
+# a search briefly uses a full core (reranking on the CPU).
+resources:
+  requests: { cpu: 100m, memory: 512Mi }
+  limits: { cpu: "1", memory: 1Gi }
+
+# Ollama for the embeddings of search queries and of the knowledge base.
+ollama:
+  enabled: true # false = use an existing Ollama at `url`
+  url: "" # only used when enabled: false, e.g. http://ollama.ai.svc:11434
+  image: ollama/ollama:0.32.11
+  # Measured: ~450 MiB with nomic-embed-text loaded; embedding needs no GPU.
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { cpu: "2", memory: 2Gi }

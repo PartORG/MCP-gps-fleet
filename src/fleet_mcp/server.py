@@ -26,6 +26,7 @@ as a crash: the model only sees "Error executing tool ..." and the server logs
 the traceback.
 """
 
+import hmac
 import os
 import sqlite3
 import sys
@@ -34,10 +35,13 @@ from datetime import datetime
 from typing import Annotated
 
 import httpx
+import uvicorn
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field
+from starlette.requests import Request
+from starlette.responses import JSONResponse, PlainTextResponse
 
 from fleet_mcp import db, rag
 from fleet_mcp.models import (
@@ -213,6 +217,68 @@ def search_similar_incidents(
     return _search(description, "incident", limit)
 
 
+# --- HTTP deployment: health checks and authentication (v6) -----------------------------
+
+
+@mcp.custom_route("/healthz", methods=["GET"])
+async def healthz(request: Request) -> PlainTextResponse:
+    """Liveness: the process is up and answering HTTP.  Kubernetes restarts the pod if not.
+
+    Deliberately checks nothing else: a missing database is not fixed by a restart.
+    """
+    return PlainTextResponse("ok")
+
+
+@mcp.custom_route("/readyz", methods=["GET"])
+async def readyz(request: Request) -> JSONResponse:
+    """Readiness: the data the tools need is in place.  Kubernetes only sends traffic if so.
+
+    The knowledge base needs Ollama at query time too, but an Ollama outage only breaks the
+    two search tools (with a clear ToolError), so it doesn't make the whole server unready.
+    """
+    checks = {"fleet_db": db.DB_PATH.exists(), "kb_db": rag.KB_PATH.exists()}
+    if checks["fleet_db"]:
+        try:
+            with closing(db.connect()) as conn:
+                conn.execute("SELECT 1 FROM vehicles LIMIT 1")
+        except sqlite3.Error:
+            checks["fleet_db"] = False
+    return JSONResponse(checks, status_code=200 if all(checks.values()) else 503)
+
+
+# Paths reachable without a token: Kubernetes probes don't carry credentials.
+PUBLIC_PATHS = {"/healthz", "/readyz"}
+
+
+def require_token(app, token: str):
+    """Wrap an ASGI app so every request except PUBLIC_PATHS needs `Authorization: Bearer <token>`.
+
+    ASGI is the interface between the web server (uvicorn) and the app: every request
+    arrives as a call app(scope, receive, send).  Wrapping it lets us reject a request
+    before the MCP app ever sees it.  Non-HTTP events (the "lifespan" startup/shutdown
+    messages) pass through untouched.
+
+    ponytail: one shared static token (fine for one team / one client); for per-user
+    access switch to the SDK's OAuth support (MCPServer(auth=..., token_verifier=...)).
+    """
+    expected = f"Bearer {token}".encode()
+
+    async def guarded(scope, receive, send):
+        if scope["type"] == "http" and scope["path"] not in PUBLIC_PATHS:
+            sent = dict(scope["headers"]).get(b"authorization", b"")
+            # compare_digest takes the same time whether the first or the last byte differs,
+            # so the token can't be guessed byte by byte from response times.
+            if not hmac.compare_digest(sent, expected):
+                response = PlainTextResponse(
+                    "Unauthorized", status_code=401, headers={"WWW-Authenticate": "Bearer"}
+                )
+                await response(scope, receive, send)
+                return
+        await app(scope, receive, send)
+
+    return guarded
+
+
 # Hosts for which the MCP SDK automatically enables DNS-rebinding protection
 # (it checks the Host/Origin headers, so a malicious web page in your browser
 # cannot talk to this local server).
@@ -225,6 +291,8 @@ def main() -> None:
     FLEET_TRANSPORT  stdio (default) | http
     FLEET_HOST       127.0.0.1 (default), http only
     FLEET_PORT       8000 (default), http only
+    FLEET_API_TOKEN  http only: require `Authorization: Bearer <token>`.  Mandatory
+                     when FLEET_HOST is not a localhost address (e.g. 0.0.0.0 in a container).
 
     Same tools either way; only the way messages travel changes.
     """
@@ -238,13 +306,27 @@ def main() -> None:
         # The client (Claude Code, see .mcp.json) starts us and talks over stdin/stdout.
         mcp.run()
     elif transport == "http":
-        # A long-running server at http://<host>:<port>/mcp that clients connect to.
-        host = os.environ.get("FLEET_HOST", "127.0.0.1")
-        if host not in LOCAL_HOSTS:
-            # ponytail: localhost only; v6 adds auth, then non-local hosts become allowed.
-            sys.exit(
-                f"FLEET_HOST={host!r} would expose the server without authentication. Use one of {LOCAL_HOSTS}."
-            )
-        mcp.run("streamable-http", host=host, port=int(os.environ.get("FLEET_PORT", "8000")))
+        serve_http()
     else:
         sys.exit(f"FLEET_TRANSPORT must be 'stdio' or 'http', got {transport!r}.")
+
+
+def serve_http() -> None:
+    """A long-running server at http://<host>:<port>/mcp, plus /healthz and /readyz."""
+    host = os.environ.get("FLEET_HOST", "127.0.0.1")
+    port = os.environ.get("FLEET_PORT", "8000")
+    token = os.environ.get("FLEET_API_TOKEN")
+    if not port.isdigit():
+        sys.exit(f"FLEET_PORT must be a number, got {port!r}.")
+    if host not in LOCAL_HOSTS and not token:
+        sys.exit(f"FLEET_HOST={host!r} would expose the server without authentication. Set FLEET_API_TOKEN.")
+    if token is not None and len(token) < 32:
+        sys.exit("FLEET_API_TOKEN is too short (min. 32 characters). Generate one: openssl rand -hex 32")
+
+    # Instead of mcp.run("streamable-http"), build the app ourselves so we can wrap it.
+    # `host` is passed so the SDK still enables DNS-rebinding protection for localhost.
+    # (For 0.0.0.0 it doesn't; the token covers that: a browser page can't attach it.)
+    app = mcp.streamable_http_app(host=host)
+    if token:
+        app = require_token(app, token)
+    uvicorn.run(app, host=host, port=int(port), log_level="info")

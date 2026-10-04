@@ -14,6 +14,7 @@ import time
 from contextlib import closing, contextmanager
 from pathlib import Path
 
+import httpx
 import pytest
 from mcp import Client, StdioServerParameters
 from mcp.server.mcpserver.exceptions import ToolError
@@ -152,13 +153,16 @@ def port_open(port):
 
 
 @contextmanager
-def http_server(db_path):
-    """Run `fleet-mcp` over HTTP on a free port for the duration of a `with`; yields its URL."""
+def http_server(db_path, **env):
+    """Run `fleet-mcp` over HTTP on a free port for the duration of a `with`; yields its URL.
+
+    Extra keyword arguments become env vars of the server, e.g. FLEET_API_TOKEN="...".
+    """
     with socket.socket() as s:  # ask the OS for a free port
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
     # `with Popen` closes the stderr pipe and waits for the process on exit.
-    with run_server(db_path, FLEET_TRANSPORT="http", FLEET_PORT=str(port)) as proc:
+    with run_server(db_path, FLEET_TRANSPORT="http", FLEET_PORT=str(port), **env) as proc:
         try:
             # Wait until the server accepts connections (uvicorn needs a moment to start).
             deadline = time.monotonic() + 10
@@ -200,6 +204,8 @@ def test_http_transport(db_path):
     [
         ({"FLEET_TRANSPORT": "http", "FLEET_HOST": "0.0.0.0"}, "without authentication"),
         ({"FLEET_TRANSPORT": "sse"}, "must be 'stdio' or 'http'"),
+        ({"FLEET_TRANSPORT": "http", "FLEET_API_TOKEN": "short"}, "too short"),
+        ({"FLEET_TRANSPORT": "http", "FLEET_PORT": "80a"}, "must be a number"),
     ],
 )
 def test_bad_transport_settings_are_refused(db_path, env, message):
@@ -207,3 +213,29 @@ def test_bad_transport_settings_are_refused(db_path, env, message):
     _, stderr = proc.communicate(timeout=10)
     assert proc.returncode == 1
     assert message in stderr
+
+
+# --- v6: health checks and token auth -------------------------------------------------
+
+TOKEN = "t" * 32  # any 32+ character string; real deployments use `openssl rand -hex 32`
+
+
+def test_health_endpoints(db_path, tmp_path):
+    """/healthz = process alive; /readyz = data in place (503 until both DB files exist)."""
+    kb = tmp_path / "kb.db"
+    with http_server(db_path, FLEET_KB_DB=str(kb)) as url:
+        base = url.removesuffix("/mcp")
+        assert httpx.get(f"{base}/healthz").status_code == 200
+        not_ready = httpx.get(f"{base}/readyz")
+        assert not_ready.status_code == 503
+        assert not_ready.json() == {"fleet_db": True, "kb_db": False}
+        kb.touch()  # readiness only checks that the index file exists
+        assert httpx.get(f"{base}/readyz").status_code == 200
+
+
+def test_token_is_required_except_for_probes(db_path):
+    # 0.0.0.0 = all interfaces, as in a container; allowed because a token is set
+    with http_server(db_path, FLEET_HOST="0.0.0.0", FLEET_API_TOKEN=TOKEN) as url:
+        assert httpx.post(url, json={}).status_code == 401
+        assert httpx.post(url, json={}, headers={"Authorization": "Bearer wrong"}).status_code == 401
+        assert httpx.get(url.removesuffix("/mcp") + "/healthz").status_code == 200  # probes stay open

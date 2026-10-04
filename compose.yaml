@@ -1,0 +1,34 @@
+# Local stack: Ollama (embeddings) + fleet-mcp over HTTP, the same way it runs in Kubernetes.
+#
+#   echo "FLEET_API_TOKEN=$(openssl rand -hex 32)" > .env     # once; .env is gitignored
+#   docker compose up --build
+#
+# MCP endpoint: http://127.0.0.1:8000/mcp  (header  Authorization: Bearer <token from .env>)
+# Health:       http://127.0.0.1:8000/healthz   http://127.0.0.1:8000/readyz
+services:
+  ollama:
+    image: ollama/ollama:0.32.11
+    volumes:
+      - ollama:/root/.ollama # pulled models survive `docker compose down`
+    healthcheck:
+      test: ["CMD", "ollama", "list"] # the image has no curl; the CLI asks the server
+      interval: 5s
+      retries: 30
+
+  fleet-mcp:
+    build: .
+    # Data first (synthetic fleet ending "now" + knowledge-base index; the first run also
+    # pulls the embedding model into Ollama), then `exec` so fleet-mcp gets the signals.
+    command: sh -c "fleet-seed && fleet-ingest && exec fleet-mcp"
+    environment:
+      OLLAMA_URL: http://ollama:11434
+      # ${VAR:?msg}: compose refuses to start if the token is missing, instead of running open.
+      FLEET_API_TOKEN: ${FLEET_API_TOKEN:?set FLEET_API_TOKEN in .env, see the top of compose.yaml}
+    ports:
+      - "127.0.0.1:8000:8000" # published on this machine only, not the whole network
+    depends_on:
+      ollama:
+        condition: service_healthy
+
+volumes:
+  ollama:
