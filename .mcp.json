@@ -1,0 +1,5 @@
+{
+  "mcpServers": {
+    "fleet": { "command": "uv", "args": ["run", "fleet-mcp"] }
+  }
+}

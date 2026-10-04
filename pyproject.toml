@@ -1,0 +1,29 @@
+[project]
+name = "fleet-mcp"
+version = "0.1.0"
+description = "MCP server over a synthetic fleet-management database"
+readme = "README.md"
+authors = [
+    { name = "Ievgen Perederieiev", email = "ievgen2325@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "mcp[cli]>=2.3.0",
+]
+
+[project.scripts]
+fleet-mcp = "fleet_mcp.server:main"
+fleet-seed = "fleet_mcp.seed:main"
+
+[build-system]
+requires = ["uv_build>=0.12.17,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.16.10",
+]
+
+[tool.ruff]
+line-length = 110
