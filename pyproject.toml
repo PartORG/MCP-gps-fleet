@@ -11,6 +11,9 @@ dependencies = [
     "flashrank>=0.2.10",
     "httpx>=0.28.1",
     "mcp[cli]>=2.3.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.45.0",
+    "opentelemetry-instrumentation-httpx>=0.66b0",
+    "opentelemetry-sdk>=1.45.0",
     "pydantic-ai-slim[mcp,openai]>=2.54.0",
     "sqlite-vec>=0.1.9",
 ]

@@ -1,9 +1,9 @@
 -- Fleet database schema (SQLite).
 --
 -- Conventions:
---   * A vehicle is identified by its registration plate, e.g. 'FM-0231'.
+--   * A vehicle is identified by its registration plate, e.g. 'FM-0977'.
 --     Using the plate as the primary key means every table speaks the same
---     language as the user ("what happened to FM-0231?") with no id lookups.
+--     language as the user ("what happened to FM-0977?") with no id lookups.
 --   * All timestamps are UTC text in SQLite's own format 'YYYY-MM-DD HH:MM:SS'.
 --     That format sorts correctly as a string, so `ts >= datetime('now', '-1 day')`
 --     works directly in SQL without any date parsing.

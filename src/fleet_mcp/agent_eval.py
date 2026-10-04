@@ -1,7 +1,9 @@
 """Agent eval: which local chat model answers fleet questions best through our MCP server?
 
-Run:  uv run fleet-agent-eval                      every variant (takes 10-30 min)
+Run:  uv run fleet-agent-eval                      every variant, every question once
       uv run fleet-agent-eval qwen3:4b llama3.2:3b only these variants
+      uv run fleet-agent-eval --runs 3              each question 3 times (local models
+                                                    vary from run to run; ~1 h for all)
 
 rag_eval.py measures retrieval alone; this measures the whole loop a user sees:
 the model must pick the right tools, in the right order, with real arguments, and
@@ -20,10 +22,11 @@ questions.  Per run we check:
   retries    tool calls the server rejected (bad arguments, unknown plate...) that the
              model then had to correct; not a failure in itself, but costs time.
 
-A run PASSES with all tools, all facts and nothing invented.  One run per question and
-model: local models are not deterministic, so treat small differences as noise.
+A run PASSES with all tools, all facts and nothing invented.  Local models are not
+deterministic: use --runs 3 (or more) before drawing conclusions from small differences.
 """
 
+import argparse
 import asyncio
 import re
 import sys
@@ -79,6 +82,11 @@ def _where_is(conn, registration: str) -> list[str]:
     return [status.nearest_city, status.driver] if status.driver else [status.nearest_city]
 
 
+def _driver_and_status(conn, registration: str) -> list[str]:
+    status = db.vehicle_status(conn, registration)
+    return [status.driver, status.status]
+
+
 CASES = [
     Case(
         "Which vehicles are offline right now?",
@@ -111,6 +119,30 @@ CASES = [
         "What speed limit applies to our trucks on German motorways?",
         [{"search_fleet_knowledge"}],
         lambda c: ["80"],
+    ),
+    # Facts below are chosen to stay stable during a long eval run: nothing that depends on
+    # a sliding time window like "trips in the last 24 hours".
+    Case(
+        "Which vehicles are idle right now?",
+        [{"list_vehicles"}],
+        lambda c: _plates(c, "SELECT registration FROM vehicles WHERE status = 'idle'"),
+    ),
+    Case(
+        "Who is the assigned driver of FM-0012, and what is the vehicle's status?",
+        [{"get_vehicle_status", "list_vehicles"}],
+        lambda c: _driver_and_status(c, "FM-0012"),
+    ),
+    Case(
+        "Have we had GPS problems with FM-0550 before? What was the cause?",
+        [{"search_similar_incidents", "search_fleet_knowledge"}],
+        lambda c: ["antenna"],  # incident #1208: loose, corroded antenna connector
+    ),
+    Case(
+        "Which vehicles had the three most recent fuel drop alerts?",
+        [{"find_anomalies"}],
+        lambda c: _plates(
+            c, "SELECT registration FROM alerts WHERE type = 'fuel_drop' ORDER BY ts DESC LIMIT 3"
+        ),
     ),
 ]
 
@@ -178,52 +210,73 @@ async def run_case(agent, case: Case, facts: list[str]) -> dict:
     return run
 
 
-async def evaluate(label: str, facts: list[list[str]]) -> list[dict]:
+async def evaluate(label: str, facts: list[list[str]], repeats: int) -> list[dict]:
+    """All questions, `repeats` times, for one variant.  Each run dict gets its question index."""
     model, base, extra = VARIANTS[label]
     ensure_model(model, base)
     agent = chat.build_agent(model, extra)
     runs = []
     async with agent:  # one MCP server process for all questions of this variant
-        for i, (case, case_facts) in enumerate(zip(CASES, facts, strict=True), start=1):
-            run = await run_case(agent, case, case_facts)
-            mark = "PASS" if run["passed"] else "fail"
-            detail = run.get("error") or ", ".join(
-                f"{k}={run[k]}" for k in ("tools_ok", "missing", "invented") if run[k] not in (True, [], ())
-            )
-            print(f"  [{label}] {i}/{len(CASES)} {mark} {run['seconds']:5.0f}s  {detail}", flush=True)
-            if not run["passed"] and "answer" in run:  # show what the model said instead
-                print(f"      answer: {run['answer'][:150]}", flush=True)
-            runs.append(run)
+        for _ in range(repeats):
+            for i, (case, case_facts) in enumerate(zip(CASES, facts, strict=True), start=1):
+                run = await run_case(agent, case, case_facts)
+                run["question"] = i
+                mark = "PASS" if run["passed"] else "fail"
+                detail = run.get("error") or ", ".join(
+                    f"{k}={run[k]}"
+                    for k in ("tools_ok", "missing", "invented")
+                    if run[k] not in (True, [], ())
+                )
+                print(f"  [{label}] Q{i} {mark} {run['seconds']:5.0f}s  {detail}", flush=True)
+                if not run["passed"] and "answer" in run:  # show what the model said instead
+                    print(f"      answer: {run['answer'][:150]}", flush=True)
+                runs.append(run)
     return runs
 
 
 def main() -> None:
-    labels = sys.argv[1:] or list(VARIANTS)
-    if unknown := set(labels) - set(VARIANTS):
+    parser = argparse.ArgumentParser(description="Compare local chat models end to end.")
+    parser.add_argument(
+        "variants", nargs="*", default=list(VARIANTS), help=f"default: all of {list(VARIANTS)}"
+    )
+    parser.add_argument("--runs", type=int, default=1, help="repeat every question N times (models vary)")
+    args = parser.parse_args()
+    if unknown := set(args.variants) - set(VARIANTS):
         sys.exit(f"Unknown variant(s) {sorted(unknown)}; choose from {list(VARIANTS)}")
     # The expected facts are computed once, from the same fleet.db the MCP server reads.
     with closing(db.connect()) as conn:
         facts = [case.facts(conn) for case in CASES]
 
     results = {}
-    for label in labels:
+    for label in args.variants:
         print(f"{label}:", flush=True)
-        results[label] = asyncio.run(evaluate(label, facts))
+        results[label] = asyncio.run(evaluate(label, facts, args.runs))
 
-    print(f"\n{len(CASES)} questions, one run each\n")
+    print(f"\n{len(CASES)} questions x {args.runs} run(s) per variant\n")
     print(
-        f"{'variant':<20}{'passed':>8}{'tools':>7}{'facts':>7}{'invent':>8}{'retry':>7}{'median s':>10}{'max ctx':>9}"
+        f"{'variant':<20}{'passed':>9}{'tools':>8}{'facts':>8}{'invent':>8}{'retry':>7}{'median s':>10}{'max ctx':>9}"
     )
     for label, runs in results.items():
         ok = [r for r in runs if "error" not in r]
+        n = len(runs)
         print(
             f"{label:<20}"
-            f"{sum(r['passed'] for r in runs):>5}/{len(runs)}"
-            f"{sum(r['tools_ok'] for r in ok):>5}/{len(runs)}"
-            f"{sum(not r['missing'] for r in ok):>5}/{len(runs)}"
+            f"{sum(r['passed'] for r in runs):>6}/{n}"
+            f"{sum(r['tools_ok'] for r in ok):>5}/{n}"
+            f"{sum(not r['missing'] for r in ok):>5}/{n}"
             f"{sum(len(r['invented']) for r in ok):>8}"
             f"{sum(r['retries'] for r in ok):>7}"
             f"{median(r['seconds'] for r in runs):>10.0f}"
             f"{max((r['context'] for r in ok), default=0):>9}"
         )
     print("\npassed = right tools + all facts + nothing invented; invent = made-up plates (total)")
+
+    # Which questions are hard for which model: passes out of runs, per question.
+    print("\npasses per question:")
+    print(f"{'':<4}" + "".join(f"{label[:18]:>20}" for label in results))
+    for i, case in enumerate(CASES, start=1):
+        cells = "".join(
+            f"{sum(r['passed'] for r in runs if r['question'] == i):>18}/{args.runs}"
+            for runs in results.values()
+        )
+        print(f"Q{i:<3}{cells}   {case.question[:60]}")

@@ -43,7 +43,7 @@ from pydantic import Field
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
 
-from fleet_mcp import db, rag
+from fleet_mcp import db, rag, telemetry
 from fleet_mcp.models import (
     Alert,
     AlertType,
@@ -60,7 +60,7 @@ mcp = MCPServer(
     "fleet",
     instructions=(
         "Tools over a fleet-management database of ~50 vehicles driving between German cities. "
-        "Vehicles are identified by registration plates like 'FM-0231'. All times are UTC. "
+        "Vehicles are identified by registration plates: 'FM-' followed by four digits. All times are UTC. "
         "Typical flow: find_anomalies / find_speed_violations / find_idle_vehicles to discover "
         "something, or list_vehicles to see vehicles by status; then get_vehicle_status and "
         "get_vehicle_history to inspect one vehicle. "
@@ -75,7 +75,9 @@ READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=False)
 
 # Reusable parameter types.  Field constraints are enforced by Pydantic before
 # our code runs, so a model asking for limit=10_000 gets a validation error.
-Registration = Annotated[str, Field(description="Vehicle registration plate, e.g. 'FM-0231'")]
+# The format is described instead of shown: with an example plate in the description, a
+# small model (llama3.2:3b in fleet-agent-eval) copied that non-existent plate into an answer.
+Registration = Annotated[str, Field(description="Vehicle registration plate: 'FM-' followed by four digits")]
 Limit = Annotated[int, Field(ge=1, le=500, description="Maximum number of rows to return")]
 SinceHours = Annotated[int, Field(ge=1, le=24 * 30, description="Look back this many hours")]
 
@@ -87,7 +89,9 @@ def get_vehicle_status(registration: Registration) -> VehicleStatus:
     with closing(db.connect()) as conn:
         status = db.vehicle_status(conn, registration)
     if status is None:
-        raise ToolError(f"Unknown vehicle {registration!r}. Registrations look like 'FM-0231'.")
+        raise ToolError(
+            f"Unknown vehicle {registration!r}. Registrations are 'FM-' followed by four digits; list_vehicles shows all."
+        )
     return status
 
 
@@ -120,7 +124,9 @@ def get_vehicle_history(
     see what a vehicle actually did around an alert, e.g. position jumps or fuel changes."""
     with closing(db.connect()) as conn:
         if db.vehicle_status(conn, registration) is None:
-            raise ToolError(f"Unknown vehicle {registration!r}. Registrations look like 'FM-0231'.")
+            raise ToolError(
+                f"Unknown vehicle {registration!r}. Registrations are 'FM-' followed by four digits; list_vehicles shows all."
+            )
         return db.vehicle_history(conn, registration, since, until, limit)
 
 
@@ -148,8 +154,9 @@ def find_speed_violations(
     since_hours: SinceHours = 24 * 7,
     limit: Limit = 50,
 ) -> list[SpeedViolation]:
-    """Telemetry samples above a speed threshold (fleet policy limit is 130 km/h), fastest
-    first, with the vehicle and the driver of that trip."""
+    """Telemetry samples above a speed threshold (fleet policy limit is 130 km/h), sorted
+    FASTEST first, with the vehicle and the driver of that trip.  Use this for "who drove
+    fastest / highest speed" questions (find_anomalies is sorted by time, not speed)."""
     with closing(db.connect()) as conn:
         return db.speed_violations(conn, min_speed_kmh, since_hours, limit)
 
@@ -161,7 +168,8 @@ def find_anomalies(
     since_hours: SinceHours = 24 * 7,
     limit: Limit = 50,
 ) -> list[Alert]:
-    """Alerts raised by the telematics platform, newest first.  Types: gps_jump (position
+    """Alerts raised by the telematics platform, sorted NEWEST first (not by speed or
+    severity; for the highest speeds use find_speed_violations).  Types: gps_jump (position
     jumped and came back), speeding, fuel_drop (unexplained fuel loss), long_idle (engine
     running while standing).  Follow up with get_vehicle_history around the alert time."""
     with closing(db.connect()) as conn:
@@ -296,6 +304,7 @@ def main() -> None:
 
     Same tools either way; only the way messages travel changes.
     """
+    telemetry.setup("fleet-mcp")  # only if OTEL_EXPORTER_OTLP_ENDPOINT is set
     # Every error below goes through sys.exit(msg), which prints to stderr:
     # with stdio, stdout belongs to the MCP protocol and must stay clean.
     if not db.DB_PATH.exists():

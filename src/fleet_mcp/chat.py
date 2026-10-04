@@ -38,6 +38,7 @@ from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.models.ollama import OllamaModel
 from pydantic_ai.providers.ollama import OllamaProvider
 
+from fleet_mcp import telemetry
 from fleet_mcp.rag import OLLAMA_URL, ROOT
 
 # fleet-qwen3 = qwen3:8b with a 12k context window, created from ./Modelfile (see the comments there).
@@ -78,7 +79,8 @@ def build_agent(model_name: str = CHAT_MODEL, extra_instructions: str = "") -> A
         # forwarded explicitly, or e.g. OLLAMA_URL / FLEET_DB would be silently ignored.
         # FLEET_TRANSPORT is pinned: the server we start here must speak stdio, even if your
         # shell has FLEET_TRANSPORT=http set for running a separate HTTP server.
-        ours = {k: v for k, v in os.environ.items() if k.startswith("FLEET_") or k == "OLLAMA_URL"}
+        # OTEL_*: the server exports its spans to the same place (see telemetry.py).
+        ours = {k: v for k, v in os.environ.items() if k.startswith(("FLEET_", "OTEL_")) or k == "OLLAMA_URL"}
         env = server.get("env", {}) | ours | {"FLEET_TRANSPORT": "stdio"}
         # cwd=ROOT: `uv run` must start inside the project, wherever fleet-chat was launched from.
         transport = StdioTransport(server["command"], server["args"], env=env, cwd=str(ROOT))
@@ -131,6 +133,8 @@ async def chat(question: str | None) -> None:
 
 
 def main() -> None:
+    if telemetry.setup("fleet-chat"):
+        Agent.instrument_all()  # Pydantic AI spans: agent run, model requests, tool calls
     try:
         asyncio.run(chat(" ".join(sys.argv[1:]) or None))
     except KeyboardInterrupt:  # Ctrl-C: asyncio.run re-raises it here, after cleaning up

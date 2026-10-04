@@ -13,6 +13,11 @@ auth:
 service:
   port: 8000
 
+# Extra environment variables for the fleet-mcp container, e.g. to export traces:
+#   extraEnv:
+#     - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://otel-collector.observability:4318" }
+extraEnv: []
+
 # Measured under load: ~400 MiB once the reranker model is loaded, near-zero idle CPU;
 # a search briefly uses a full core (reranking on the CPU).
 resources:

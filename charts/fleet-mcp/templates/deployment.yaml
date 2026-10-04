@@ -70,6 +70,9 @@ spec:
                 secretKeyRef:
                   name: {{ required "auth.existingSecret is required (see values.yaml)" .Values.auth.existingSecret }}
                   key: token
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           readinessProbe:
             httpGet: { path: /readyz, port: http }
             periodSeconds: 5

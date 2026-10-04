@@ -37,6 +37,7 @@ from typing import Literal, NamedTuple
 
 import httpx
 import sqlite_vec
+from opentelemetry import trace
 
 from fleet_mcp import db
 from fleet_mcp.models import KnowledgeChunk
@@ -95,6 +96,10 @@ RRF_K = 60
 # the Docker image bakes it into /app/models via FLEET_MODELS_DIR, outside the data volume.
 RERANK_MODEL = "ms-marco-MiniLM-L-12-v2"
 MODELS_DIR = Path(os.environ.get("FLEET_MODELS_DIR", ROOT / "data" / "models"))
+
+# Spans for the search stages (no-ops unless telemetry.setup() configured an exporter).
+# The query text is deliberately not recorded: traces often end up in shared backends.
+tracer = trace.get_tracer(__name__)
 
 # vector / keyword: one retriever.  hybrid: both, fused.  rerank: hybrid + reranker.
 Mode = Literal["vector", "keyword", "hybrid", "rerank"]
@@ -206,12 +211,14 @@ def ingest(kb_dir: Path, path: Path) -> int:
     return len(chunks)
 
 
+@tracer.start_as_current_span("rag.search")
 def search(conn, query: str, kind: str | None, limit: int, mode: Mode = "rerank") -> list[KnowledgeChunk]:
     """The `limit` most relevant chunks for `query`, best first; `kind` filters guide/incident.
 
     The MCP tools use the default, "rerank" (best in `fleet-eval`: hit@1 0.95 vs 0.82 for
     hybrid, for ~250 ms more per search).  The other modes exist to compare them in the eval.
     """
+    trace.get_current_span().set_attributes({"rag.mode": mode, "rag.kind": kind or "any", "rag.limit": limit})
     rankings = []  # one list of chunk ids per retriever, best first
     if mode in ("vector", "hybrid", "rerank"):
         rankings.append(_vector_ranking(conn, query, kind))
@@ -253,6 +260,7 @@ def _reranker():
     return Ranker(model_name=RERANK_MODEL, cache_dir=str(MODELS_DIR), log_level="WARNING")
 
 
+@tracer.start_as_current_span("rag.rerank")
 def _rerank_scores(query: str, texts: dict[int, str]) -> dict[int, float]:
     """Cross-encoder relevance of each chunk text to `query`, by chunk id (higher = better)."""
     from flashrank import RerankRequest
@@ -263,6 +271,7 @@ def _rerank_scores(query: str, texts: dict[int, str]) -> dict[int, float]:
     }
 
 
+@tracer.start_as_current_span("rag.vector")
 def _vector_ranking(conn, query: str, kind: str | None) -> list[int]:
     """Chunk ids closest in meaning to `query` (cosine distance of embeddings)."""
     [vector] = embed([query], query=True)
@@ -276,6 +285,7 @@ def _vector_ranking(conn, query: str, kind: str | None) -> list[int]:
     return [r[0] for r in rows]
 
 
+@tracer.start_as_current_span("rag.keyword")
 def _keyword_ranking(conn, query: str, kind: str | None) -> list[int]:
     """Chunk ids sharing the most (rare) words with `query`, by FTS5's BM25 ranking."""
     # FTS5 has its own query language (AND, NOT, quotes, *, ...), so passing the raw
