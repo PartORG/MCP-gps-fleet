@@ -46,6 +46,7 @@ from fleet_mcp.models import (
     IdleVehicle,
     KnowledgeChunk,
     SpeedViolation,
+    Status,
     TelemetryPoint,
     VehicleStatus,
 )
@@ -56,7 +57,8 @@ mcp = MCPServer(
         "Tools over a fleet-management database of ~50 vehicles driving between German cities. "
         "Vehicles are identified by registration plates like 'FM-0231'. All times are UTC. "
         "Typical flow: find_anomalies / find_speed_violations / find_idle_vehicles to discover "
-        "something, then get_vehicle_status and get_vehicle_history to inspect one vehicle. "
+        "something, or list_vehicles to see vehicles by status; then get_vehicle_status and "
+        "get_vehicle_history to inspect one vehicle. "
         "The database holds facts; to explain them, use search_similar_incidents (how past cases "
         "like this were resolved) and search_fleet_knowledge (policies, troubleshooting guides). "
         "Base explanations on both: what the data shows and what the knowledge base says."
@@ -82,6 +84,19 @@ def get_vehicle_status(registration: Registration) -> VehicleStatus:
     if status is None:
         raise ToolError(f"Unknown vehicle {registration!r}. Registrations look like 'FM-0231'.")
     return status
+
+
+@mcp.tool(annotations=READ_ONLY)
+def list_vehicles(
+    status: Annotated[
+        Status | None, Field(description="Only vehicles with this status; omit for all")
+    ] = None,
+) -> list[VehicleStatus]:
+    """List vehicles with the same details as get_vehicle_status (driver, fuel, last position
+    and nearest city), optionally only those with one status.  Use it for questions like
+    "which vehicles are offline / in maintenance, and where are they?"."""
+    with closing(db.connect()) as conn:
+        return db.vehicles(conn, status=status)
 
 
 @mcp.tool(annotations=READ_ONLY)

@@ -93,23 +93,37 @@ def connect(path: Path | None = None, *, readonly: bool = True) -> sqlite3.Conne
 # --- queries ---------------------------------------------------------------------
 
 
-def vehicle_status(conn: sqlite3.Connection, registration: str) -> VehicleStatus | None:
-    """One vehicle joined with its driver and last position; None if unknown."""
-    row = conn.execute(
+def vehicles(
+    conn: sqlite3.Connection, *, registration: str | None = None, status: str | None = None
+) -> list[VehicleStatus]:
+    """Vehicles joined with their driver and last position, ordered by plate.
+
+    Both filters are optional; a NULL parameter means "any" (same trick as in alerts()).
+    """
+    rows = conn.execute(
         """
         SELECT v.registration, v.brand, v.model, v.year, v.status, v.fuel_level, v.odometer_km,
                d.name AS driver, p.ts AS last_seen, p.lat, p.lon, p.speed_kmh
         FROM vehicles v
         LEFT JOIN drivers d       ON d.id = v.driver_id
         LEFT JOIN last_position p ON p.registration = v.registration
-        WHERE v.registration = ?
+        WHERE (:reg    IS NULL OR v.registration = :reg)
+          AND (:status IS NULL OR v.status = :status)
+        ORDER BY v.registration
         """,
-        (registration.strip().upper(),),
-    ).fetchone()
-    if row is None:
-        return None
-    city = nearest_city(row["lat"], row["lon"]) if row["lat"] is not None else None
-    return VehicleStatus(**row, nearest_city=city)
+        {"reg": registration.strip().upper() if registration else None, "status": status},
+    ).fetchall()
+    # A vehicle that never reported has no position, hence no city.
+    return [
+        VehicleStatus(**r, nearest_city=nearest_city(r["lat"], r["lon"]) if r["lat"] is not None else None)
+        for r in rows
+    ]
+
+
+def vehicle_status(conn: sqlite3.Connection, registration: str) -> VehicleStatus | None:
+    """One vehicle with its driver and last position; None if unknown."""
+    found = vehicles(conn, registration=registration)
+    return found[0] if found else None
 
 
 def vehicle_history(

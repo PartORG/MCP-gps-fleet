@@ -11,7 +11,7 @@ import sqlite3
 import subprocess
 import sys
 import time
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 import pytest
@@ -95,6 +95,7 @@ def test_tools_are_registered(server):
     names = {t.name for t in asyncio.run(server.list_tools())}
     assert names == {
         "get_vehicle_status",
+        "list_vehicles",
         "get_vehicle_history",
         "get_fleet_statistics",
         "find_idle_vehicles",
@@ -112,6 +113,15 @@ def test_anomaly_then_history_flow(server):
         server, "get_vehicle_history", registration=alert["registration"].lower(), until=alert["ts"], limit=3
     ).structured_content["result"]
     assert history[-1]["ts"] == alert["ts"]
+
+
+def test_list_vehicles_by_status(server, conn):
+    """The question the v3 chat could not answer: which vehicles are offline, and where?"""
+    offline = call(server, "list_vehicles", status="offline").structured_content["result"]
+    expected = {r[0] for r in conn.execute("SELECT registration FROM vehicles WHERE status = 'offline'")}
+    assert {v["registration"] for v in offline} == expected
+    assert all(v["status"] == "offline" and v["nearest_city"] for v in offline)
+    assert len(call(server, "list_vehicles").structured_content["result"]) == 50  # no filter = all
 
 
 def test_unknown_vehicle_is_a_tool_error(server):
@@ -141,18 +151,9 @@ def port_open(port):
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
-def test_stdio_transport(db_path):
-    """Default transport: the client starts the server, exactly like Claude Code via .mcp.json."""
-    params = StdioServerParameters(command=FLEET_MCP, env={**os.environ, "FLEET_DB": str(db_path)})
-
-    async def talk():
-        async with Client(params) as client:
-            return len((await client.list_tools()).tools)
-
-    assert asyncio.run(talk()) == 8
-
-
-def test_http_transport(db_path):
+@contextmanager
+def http_server(db_path):
+    """Run `fleet-mcp` over HTTP on a free port for the duration of a `with`; yields its URL."""
     with socket.socket() as s:  # ask the OS for a free port
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
@@ -165,18 +166,33 @@ def test_http_transport(db_path):
                 assert proc.poll() is None, proc.stderr.read()  # died instead of starting
                 assert time.monotonic() < deadline, "HTTP server did not start"
                 time.sleep(0.1)
-
-            async def talk():
-                async with Client(f"http://127.0.0.1:{port}/mcp") as client:
-                    tools = await client.list_tools()
-                    stats = await client.call_tool("get_fleet_statistics", {})
-                    return len(tools.tools), stats.structured_content
-
-            n_tools, stats = asyncio.run(talk())
-            assert n_tools == 8
-            assert sum(stats["vehicles_by_status"].values()) == 50
-        finally:  # stop the server even if an assert failed
+            yield f"http://127.0.0.1:{port}/mcp"
+        finally:  # stop the server even if the test failed
             proc.terminate()
+
+
+def test_stdio_transport(db_path):
+    """Default transport: the client starts the server, exactly like Claude Code via .mcp.json."""
+    params = StdioServerParameters(command=FLEET_MCP, env={**os.environ, "FLEET_DB": str(db_path)})
+
+    async def talk():
+        async with Client(params) as client:
+            return len((await client.list_tools()).tools)
+
+    assert asyncio.run(talk()) == 9
+
+
+def test_http_transport(db_path):
+    async def talk(url):
+        async with Client(url) as client:
+            tools = await client.list_tools()
+            stats = await client.call_tool("get_fleet_statistics", {})
+            return len(tools.tools), stats.structured_content
+
+    with http_server(db_path) as url:
+        n_tools, stats = asyncio.run(talk(url))
+    assert n_tools == 9
+    assert sum(stats["vehicles_by_status"].values()) == 50
 
 
 @pytest.mark.parametrize(

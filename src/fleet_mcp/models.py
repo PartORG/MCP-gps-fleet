@@ -15,6 +15,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 AlertType = Literal["gps_jump", "speeding", "fuel_drop", "long_idle"]
+Status = Literal["active", "idle", "maintenance", "offline"]
 
 
 class VehicleStatus(BaseModel):

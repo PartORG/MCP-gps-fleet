@@ -1,13 +1,13 @@
 # Fleet MCP
 
-An MCP server that lets an LLM (Claude, or later a local Ollama model) query a
+An MCP server that lets an LLM (Claude, or a fully local Ollama model) query a
 synthetic fleet-management database: 50 vehicles driving between German cities,
 with injected anomalies (GPS jumps, speeding, fuel drops, long idling), plus a
 knowledge base of guides and past incident reports searched with RAG.
 
 ```text
                                         ┌─> db.py  (read-only SQL)          ──> data/fleet.db   facts
-Claude ──MCP──> server.py (8 tools) ────┤
+Claude ──MCP──> server.py (9 tools) ────┤
                                         └─> rag.py (Ollama embeddings + KNN) ─> data/kb.db      knowledge
 ```
 
@@ -34,6 +34,22 @@ The data is relative to the time of seeding ("last 24 hours"), so re-run
 the `fleet` server.  Then ask e.g. *"Which vehicles had fuel drops today, what
 does the data show, and what could have caused it?"*
 
+### Use it fully offline: `fleet-chat`
+
+A Pydantic AI agent with a local model (qwen3:8b) talks to the same MCP server, so
+nothing leaves the machine.
+
+```bash
+ollama create fleet-qwen3 -f Modelfile   # once: qwen3:8b with a 12k context (see Modelfile)
+uv run fleet-chat                        # interactive; empty line or Ctrl-D quits
+uv run fleet-chat "Which vehicle had the most recent GPS jump, and why?"
+```
+
+It prints every tool call the model makes and the context size it used.  Expect
+30-90 s per question on an 8 GB laptop GPU.  `FLEET_CHAT_MODEL=llama3.1:8b` tries
+another Ollama model with tool support; `FLEET_MCP_URL=http://127.0.0.1:8000/mcp`
+connects to a running HTTP server instead of starting one over stdio.
+
 ### Transports: stdio (default) or HTTP
 
 Same server, same tools; environment variables pick how clients reach it.
@@ -45,7 +61,9 @@ Same server, same tools; environment variables pick how clients reach it.
 | `FLEET_PORT` | `8000` | HTTP port |
 | `FLEET_DB` | `data/fleet.db` | Fleet database file |
 | `FLEET_KB_DB` | `data/kb.db` | Knowledge-base index file |
-| `OLLAMA_URL` | `http://localhost:11434` | Ollama, used to embed search queries |
+| `OLLAMA_URL` | `http://localhost:11434` | Ollama: embeddings, and the `fleet-chat` model |
+| `FLEET_CHAT_MODEL` | `fleet-qwen3` | `fleet-chat` only: Ollama model to chat with |
+| `FLEET_MCP_URL` | *(unset = stdio)* | `fleet-chat` only: MCP server URL to connect to over HTTP |
 
 ```bash
 FLEET_TRANSPORT=http uv run fleet-mcp
@@ -72,6 +90,8 @@ npx @modelcontextprotocol/inspector uv run fleet-mcp   # MCP Inspector in the br
 | `src/fleet_mcp/models.py` | Pydantic models = the tools' output schemas |
 | `src/fleet_mcp/rag.py` | Chunking, Ollama embeddings, sqlite-vec index and search |
 | `src/fleet_mcp/server.py` | The MCP tools |
+| `src/fleet_mcp/chat.py` | Offline Pydantic AI client (`fleet-chat`) |
+| `Modelfile` | `fleet-qwen3`: qwen3:8b with a bigger context window |
 | `kb/*.md` | Guides and policies (one search chunk per `##` section) |
 | `kb/incidents/*.md` | Past incident reports (one chunk per report) |
 
@@ -80,6 +100,7 @@ npx @modelcontextprotocol/inspector uv run fleet-mcp   # MCP Inspector in the br
 | Tool | Answers |
 |---|---|
 | `get_vehicle_status` | Where is FM-0231, who drives it, how much fuel? |
+| `list_vehicles` | Which vehicles are offline / in maintenance, and where are they? |
 | `get_vehicle_history` | What did it do between two times? |
 | `get_fleet_statistics` | How is the fleet doing overall? |
 | `find_idle_vehicles` | Which vehicles have not moved for N hours? |
@@ -90,5 +111,5 @@ npx @modelcontextprotocol/inspector uv run fleet-mcp   # MCP Inspector in the br
 
 ## Roadmap
 
-v1 database + tools → v1.5 stdio/HTTP transports → v2 RAG over `kb/` (this) → v3 Pydantic AI offline client
-(qwen3:8b) → v4 hybrid search + eval → v5 flashrank reranking → v6 deployment (auth, Docker, health probes).
+v1 database + tools → v1.5 stdio/HTTP transports → v2 RAG over `kb/` → v3 Pydantic AI offline client
+(qwen3:8b) (this) → v4 hybrid search + eval → v5 flashrank reranking → v6 deployment (auth, Docker, health probes).
