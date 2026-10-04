@@ -3,12 +3,12 @@
 Run:  uv run fleet-chat                          interactive conversation
       uv run fleet-chat "which vehicles are idle?"   one question, then exit
 
-Nothing leaves the machine: the LLM (qwen3:8b), the embeddings and the data are all local.
+Nothing leaves the machine: the LLM (qwen3:4b), the embeddings and the data are all local.
 It shows the point of MCP: the same server works unchanged with Claude and with a local model.
 
 How it fits together
 --------------------
-    you ──> Pydantic AI Agent ──(OpenAI-compatible API)──> Ollama (qwen3:8b)
+    you ──> Pydantic AI Agent ──(OpenAI-compatible API)──> Ollama (qwen3:4b)
                  │      ^                                        │
                  │      └──────── "call tool X with args Y" ─────┘
                  └──MCP──> fleet-mcp (server.py) ──> fleet.db / kb.db
@@ -41,9 +41,10 @@ from pydantic_ai.providers.ollama import OllamaProvider
 from fleet_mcp import telemetry
 from fleet_mcp.rag import OLLAMA_URL, ROOT
 
-# fleet-qwen3 = qwen3:8b with a 12k context window, created from ./Modelfile (see the comments there).
+# fleet-qwen3-4b = qwen3:4b with a 12k context window, created from ./Modelfile (see the comments
+# there for why 4b: as good as 8b in fleet-agent-eval at half the size, fully on an 8 GB GPU).
 # Any Ollama model with tool support works, e.g. FLEET_CHAT_MODEL=llama3.1:8b.
-CHAT_MODEL = os.environ.get("FLEET_CHAT_MODEL", "fleet-qwen3")
+CHAT_MODEL = os.environ.get("FLEET_CHAT_MODEL", "fleet-qwen3-4b")
 
 # Client-side instructions.  The domain knowledge (what the tools are, typical flow)
 # comes from the server's own `instructions`, see include_instructions below.
@@ -103,7 +104,7 @@ async def ask(agent: Agent, question: str, history: list) -> list:
                 print(f"  [tool] {part.tool_name}({part.args_as_json_str()})")
     # Every model request re-sends the whole conversation (instructions, tool schemas, all tool
     # results so far), so the LAST request is the biggest.  That is the number that must stay
-    # below the context window (12288 for fleet-qwen3) or Ollama silently cuts the beginning.
+    # below the context window (12288 for fleet-qwen3-4b) or Ollama silently cuts the beginning.
     context = result.response.usage.input_tokens
     print(f"  [usage] {result.usage.requests} model requests, last one used {context} context tokens")
     print(f"\n{result.output}\n")
@@ -142,5 +143,5 @@ def main() -> None:
     except ModelAPIError as e:  # Ollama not running (connection error) or model missing (404)
         sys.exit(
             f"Chat model request failed: {e}\n"
-            f"Is Ollama running at {OLLAMA_URL}, and did you run `ollama create fleet-qwen3 -f Modelfile`?"
+            f"Is Ollama running at {OLLAMA_URL}, and did you run `ollama pull qwen3:4b && ollama create fleet-qwen3-4b -f Modelfile`?"
         )

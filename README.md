@@ -76,7 +76,8 @@ days old. Re-run `fleet-ingest` after editing `kb/`.
 **Chat with it, offline** (`fleet-chat`, a Pydantic AI agent with a local model):
 
 ```bash
-ollama create fleet-qwen3 -f Modelfile   # once: qwen3:8b with a 12k context window
+ollama pull qwen3:4b                        # once, 2.5 GB
+ollama create fleet-qwen3-4b -f Modelfile   # once: qwen3:4b with a 12k context window
 uv run fleet-chat                        # interactive; empty line or Ctrl-D quits
 uv run fleet-chat "Which vehicles are offline right now, and where are they?"
 ```
@@ -269,7 +270,7 @@ WantedBy=multi-user.target
 | `FLEET_KB_DB` | `data/kb.db` | Knowledge-base index |
 | `FLEET_MODELS_DIR` | `data/models` | Reranker model location |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama: embeddings, and the `fleet-chat` model |
-| `FLEET_CHAT_MODEL` | `fleet-qwen3` | `fleet-chat`: Ollama model to chat with |
+| `FLEET_CHAT_MODEL` | `fleet-qwen3-4b` | `fleet-chat`: Ollama model to chat with |
 | `FLEET_MCP_URL` | *(unset = stdio)* | `fleet-chat`: connect to this HTTP server instead of starting one |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | *(unset = off)* | OTLP/HTTP collector for traces, e.g. `http://localhost:4318` |
 
@@ -315,17 +316,19 @@ First comparison (6 questions, one run each; RTX 4070 Laptop, 8 GB):
 
 | model | passed | median time | notes |
 |---|---|---|---|
-| **qwen3:8b** (default) | 6/6 | 38 s | |
+| qwen3:8b | 6/6 | 38 s | 15 % on the CPU at 12k context (8 GB GPU) |
 | qwen3:8b, thinking off | 5/6 | 26 s | reported the newest speeding alert instead of the fastest |
-| qwen3:4b | 6/6 | 34 s | half the memory, but the most context (9.2k of 12k) |
+| **qwen3:4b** (default) | 6/6 | 34 s | half the size, 100 % on the GPU; the most context (9.2k of 12k) |
 | llama3.2:3b | 3/6 | 2 s | ~20× faster; tool call written as text, skipped searches, once invented a plate |
 
 After that, the tool descriptions were sharpened (`find_speed_violations` "fastest
 first" vs `find_anomalies` "newest first"; no example plate the model could copy). A
 10-question, 3-run comparison was cut short by low memory: in the completed runs qwen3:8b
 passed 19/20 and qwen3:8b with thinking off 19/19 (including the newest-vs-fastest
-question it failed before). qwen3:4b vs qwen3:8b is still undecided, so the default
-stays qwen3:8b.
+question it failed before); qwen3:4b was not reached.  The default is **qwen3:4b**: it
+tied qwen3:8b in the comparison at half the size and runs fully on an 8 GB GPU.  The
+evidence is thin (6 questions, one run), so re-check with
+`uv run fleet-agent-eval --runs 3 qwen3:8b qwen3:4b` when memory allows.
 
 ### Tracing (OpenTelemetry)
 
@@ -368,7 +371,7 @@ image, and publishes it to `ghcr.io/partorg/mcp-gps-fleet` from `master`.
 | `src/fleet_mcp/telemetry.py` | OpenTelemetry setup |
 | `kb/`, `kb/incidents/` | Knowledge base: guides (one chunk per `##` section), incident reports (one chunk each) |
 | `tests/` | pytest suite; `eval_questions.json` = retrieval eval set |
-| `Modelfile` | `fleet-qwen3`: qwen3:8b with a 12k context |
+| `Modelfile` | `fleet-qwen3-4b`: qwen3:4b with a 12k context |
 | `Dockerfile`, `compose.yaml`, `charts/fleet-mcp/` | Image, local/server stack, Helm chart |
 
 ### Deliberate limits

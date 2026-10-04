@@ -1,14 +1,17 @@
-# Local chat model for `fleet-chat`: qwen3:8b with a bigger context window.
+# Local chat model for `fleet-chat`: qwen3:4b with a bigger context window.
 #
 # Ollama runs models with a 4096-token context by default, and its OpenAI-compatible
-# API (used by Pydantic AI) ignores per-request `num_ctx`.  8 tool schemas plus a few
+# API (used by Pydantic AI) ignores per-request `num_ctx`.  9 tool schemas plus a few
 # tool results do not fit in 4096 tokens; Ollama would silently drop the beginning of
 # the conversation, including the instructions.  This derived model shares the
-# weights of qwen3:8b (no extra download), only the default context changes.
+# weights of qwen3:4b (no extra download), only the default context changes.
 #
-# Create once:  ollama create fleet-qwen3 -f Modelfile
+# Create once:  ollama pull qwen3:4b && ollama create fleet-qwen3-4b -f Modelfile
 #
-# 12288 is a trade-off for an 8 GB GPU: measured on an RTX 4070 Laptop, 15 % of the
-# model then runs on the CPU (4096: 0 %, 16384: 22 %).  More VRAM -> raise it.
-FROM qwen3:8b
+# Why qwen3:4b (see README, "Chat model comparison"): it passed as many eval questions
+# as qwen3:8b at half the size.  Measured on an RTX 4070 Laptop (8 GB): 4.5 GB with this
+# context, 100 % on the GPU; qwen3:8b needed 15 % on the CPU at the same context.
+# It uses the most context of the tested models (peak 9.2k of 12k in the eval), so keep
+# 12288; with more VRAM, raise num_ctx for longer conversations.
+FROM qwen3:4b
 PARAMETER num_ctx 12288
