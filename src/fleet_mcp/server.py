@@ -32,17 +32,19 @@ from contextlib import closing
 from datetime import datetime
 from typing import Annotated
 
+import httpx
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from fleet_mcp import db
+from fleet_mcp import db, rag
 from fleet_mcp.models import (
     Alert,
     AlertType,
     FleetStatistics,
     IdleVehicle,
+    KnowledgeChunk,
     SpeedViolation,
     TelemetryPoint,
     VehicleStatus,
@@ -54,7 +56,10 @@ mcp = MCPServer(
         "Tools over a fleet-management database of ~50 vehicles driving between German cities. "
         "Vehicles are identified by registration plates like 'FM-0231'. All times are UTC. "
         "Typical flow: find_anomalies / find_speed_violations / find_idle_vehicles to discover "
-        "something, then get_vehicle_status and get_vehicle_history to inspect one vehicle."
+        "something, then get_vehicle_status and get_vehicle_history to inspect one vehicle. "
+        "The database holds facts; to explain them, use search_similar_incidents (how past cases "
+        "like this were resolved) and search_fleet_knowledge (policies, troubleshooting guides). "
+        "Base explanations on both: what the data shows and what the knowledge base says."
     ),
 )
 
@@ -141,6 +146,53 @@ def find_anomalies(
     running while standing).  Follow up with get_vehicle_history around the alert time."""
     with closing(db.connect()) as conn:
         return db.alerts(conn, registration, type, since_hours, limit)
+
+
+# --- RAG tools: unstructured knowledge (kb/*.md) ------------------------------------
+# The tools above answer "what happened" from the database; these answer "what does it
+# mean / what do we do about it" from the knowledge base (see rag.py).
+
+SearchText = Annotated[str, Field(min_length=3, max_length=500)]
+SearchLimit = Annotated[int, Field(ge=1, le=20, description="Number of results")]
+
+
+def _search(query: str, kind: str | None, limit: int) -> list[KnowledgeChunk]:
+    """Shared body of the two search tools: turns setup problems into messages the model can relay."""
+    if not rag.KB_PATH.exists():
+        raise ToolError("The knowledge base is not built yet. Run `uv run fleet-ingest`.")
+    try:
+        with closing(rag.connect()) as conn:
+            return rag.search(conn, query, kind, limit)
+    except httpx.HTTPError as e:  # Ollama down, model not pulled, timeout...
+        raise ToolError(
+            f"The embedding service (Ollama at {rag.OLLAMA_URL}, model {rag.EMBED_MODEL}) failed: {e}. "
+            "Is `ollama serve` running?"
+        ) from e
+
+
+@mcp.tool(annotations=READ_ONLY)
+def search_fleet_knowledge(
+    query: Annotated[SearchText, Field(description="A question or topic in natural language")],
+    limit: SearchLimit = 5,
+) -> list[KnowledgeChunk]:
+    """Search the fleet's guides and policies: alert type definitions, vehicle statuses, GPS
+    troubleshooting and accuracy, fuel anomaly signatures, driver coaching, safety policy (speed
+    limits, driving hours), maintenance.  Use it to explain what data means and what to do next."""
+    return _search(query, "guide", limit)
+
+
+@mcp.tool(annotations=READ_ONLY)
+def search_similar_incidents(
+    description: Annotated[
+        SearchText, Field(description="What happened, e.g. 'position jumped 15 km and returned 30 s later'")
+    ],
+    limit: SearchLimit = 5,
+) -> list[KnowledgeChunk]:
+    """Find past incident reports similar to a described situation.  Each report gives the vehicle,
+    date, what was observed, the investigation, the root cause and the resolution, so it shows how
+    a similar case was explained and handled before.  Similar symptoms can have different root
+    causes: compare the details with the current data."""
+    return _search(description, "incident", limit)
 
 
 # Hosts for which the MCP SDK automatically enables DNS-rebinding protection

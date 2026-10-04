@@ -100,6 +100,8 @@ def test_tools_are_registered(server):
         "find_idle_vehicles",
         "find_speed_violations",
         "find_anomalies",
+        "search_fleet_knowledge",
+        "search_similar_incidents",
     }
 
 
@@ -147,7 +149,7 @@ def test_stdio_transport(db_path):
         async with Client(params) as client:
             return len((await client.list_tools()).tools)
 
-    assert asyncio.run(talk()) == 6
+    assert asyncio.run(talk()) == 8
 
 
 def test_http_transport(db_path):
@@ -171,7 +173,7 @@ def test_http_transport(db_path):
                     return len(tools.tools), stats.structured_content
 
             n_tools, stats = asyncio.run(talk())
-            assert n_tools == 6
+            assert n_tools == 8
             assert sum(stats["vehicles_by_status"].values()) == 50
         finally:  # stop the server even if an assert failed
             proc.terminate()

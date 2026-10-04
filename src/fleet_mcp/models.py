@@ -72,3 +72,12 @@ class FleetStatistics(BaseModel):
     km_driven_last_24h: float
     alerts_last_7d_by_type: dict[str, int]
     average_fuel_level: float
+
+
+class KnowledgeChunk(BaseModel):
+    source: str = Field(description="Markdown file in the knowledge base, e.g. 'incidents/incident_1842.md'")
+    kind: Literal["guide", "incident"]
+    title: str
+    section: str = Field(description="Section heading inside the document ('' = whole document)")
+    text: str
+    score: float = Field(description="Cosine similarity to the query, 0..1, higher = more relevant")
