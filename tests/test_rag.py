@@ -70,16 +70,32 @@ def kb(kb_path, monkeypatch):
 def test_retrieval_quality_gate(kb_path):
     """Regression gate on the eval set (tests/eval_questions.json, see rag_eval.py).
 
-    Thresholds sit just below the measured v4 numbers (hybrid hit@3 = 1.00, MRR 0.91;
-    vector MRR 0.87), so a change that makes retrieval worse fails here.  Run
-    `uv run fleet-eval` for the full per-question table.
+    Measured: vector MRR 0.87 -> hybrid 0.91 -> rerank 0.98 (hit@1 0.95, hit@3 1.00).
+    Each stage must not make ranking worse, and the mode the tools use (rerank) must
+    stay near its numbers.  Run `uv run fleet-eval` for the per-question table.
     """
     questions = json.loads(rag_eval.QUESTIONS.read_text())
     with closing(rag.connect(kb_path)) as conn:
-        hybrid = rag_eval.metrics(rag_eval.ranks(conn, "hybrid", questions))
-        vector = rag_eval.metrics(rag_eval.ranks(conn, "vector", questions))
-    assert hybrid["hit@3"] >= 0.95  # at most one question may fall out of the top 3
-    assert hybrid["MRR"] >= vector["MRR"]  # the reason hybrid exists
+        m = {
+            mode: rag_eval.metrics(rag_eval.ranks(conn, mode, questions))
+            for mode in ("vector", "hybrid", "rerank")
+        }
+    assert m["rerank"]["hit@3"] >= 0.95  # at most one question may fall out of the top 3
+    assert m["rerank"]["hit@1"] >= 0.9  # the reason the reranker exists
+    assert m["rerank"]["MRR"] >= m["hybrid"]["MRR"] >= m["vector"]["MRR"]
+
+
+@requires_ollama
+def test_scores_separate_relevant_from_irrelevant(kb):
+    """Reranker scores are an absolute 0..1 relevance, so the LLM can see when the kb has
+    nothing on a topic.  (Fusion scores are always tiny, ~0.03, and can't show that.)"""
+
+    def top_score(query):
+        results = call("search_fleet_knowledge", query=query).structured_content["result"]
+        return max(r["score"] for r in results)
+
+    assert top_score("what is the motorway speed limit for trucks") > 0.9
+    assert top_score("recipe for apple pie") < 0.1
 
 
 @requires_ollama

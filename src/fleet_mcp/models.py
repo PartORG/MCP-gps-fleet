@@ -82,5 +82,6 @@ class KnowledgeChunk(BaseModel):
     section: str = Field(description="Section heading inside the document ('' = whole document)")
     text: str
     score: float = Field(
-        description="Relevance score (rank fusion of meaning + keyword search), higher = better"
+        description="Reranker relevance 0..1: close to 1 = answers the query, close to 0 = not relevant "
+        "(the search always returns results, so low scores mean the knowledge base has nothing on it)"
     )

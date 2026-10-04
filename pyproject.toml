@@ -8,6 +8,7 @@ authors = [
 ]
 requires-python = ">=3.14"
 dependencies = [
+    "flashrank>=0.2.10",
     "httpx>=0.28.1",
     "mcp[cli]>=2.3.0",
     "pydantic-ai-slim[mcp,openai]>=2.54.0",

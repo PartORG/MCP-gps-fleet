@@ -4,15 +4,15 @@ Run:  uv run fleet-ingest      (re-run whenever a file in kb/ changes)
 
 The two halves
 --------------
-INGEST (offline, once)                       SEARCH (per tool call, "hybrid")
+INGEST (offline, once)                       SEARCH (per tool call, "rerank")
   kb/**/*.md                                   question from the LLM
     └─ split_markdown(): one chunk per           ├─ vector:  embed() the question, sqlite-vec
        "## section" (guides) or per file         │           KNN -> 20 chunks closest in MEANING
        (incident reports)                        ├─ keyword: FTS5 full-text search, BM25 ranking
     └─ embed() each chunk via Ollama             │           -> 20 chunks sharing the most WORDS
-       (nomic-embed-text, 768 numbers)           └─ fuse both rankings (RRF), keep the top `limit`
-    └─ store text in `chunks`,                      └─ list[KnowledgeChunk] to the LLM
-       vectors in `chunk_vectors`,
+       (nomic-embed-text, 768 numbers)           ├─ fuse both rankings (RRF) -> top 20
+    └─ store text in `chunks`,                   ├─ reranker re-orders those 20 -> top `limit`
+       vectors in `chunk_vectors`,               └─ list[KnowledgeChunk] to the LLM
        words in `chunks_fts` (data/kb.db)
 
 Why both?  They fail differently.  Vectors understand paraphrases ("fuel paid with the
@@ -31,6 +31,7 @@ are only how we find the relevant text.
 import os
 import re
 from collections import defaultdict
+from functools import cache
 from pathlib import Path
 from typing import Literal, NamedTuple
 
@@ -84,7 +85,18 @@ CANDIDATES = 20
 # A chunk's fused score is the sum over retrievers of 1 / (RRF_K + its rank there).
 # The larger the constant, the less a single #1 rank dominates over agreement.
 RRF_K = 60
-Mode = Literal["vector", "keyword", "hybrid"]
+
+# Reranker (v5): a small cross-encoder that reads the question and ONE chunk together and
+# scores how well the chunk answers it.  Far more precise than comparing two independently
+# computed vectors, but too slow to run over the whole kb, so it only re-orders the hybrid
+# top CANDIDATES.  flashrank runs it with onnxruntime on the CPU (~150 MB installed, no
+# PyTorch).  MiniLM-L-12 (~34 MB) is flashrank's best small English model.  The model
+# goes to data/models (flashrank's default /tmp is wiped on reboot and would re-download).
+RERANK_MODEL = "ms-marco-MiniLM-L-12-v2"
+MODELS_DIR = ROOT / "data" / "models"
+
+# vector / keyword: one retriever.  hybrid: both, fused.  rerank: hybrid + reranker.
+Mode = Literal["vector", "keyword", "hybrid", "rerank"]
 
 
 class Chunk(NamedTuple):
@@ -178,15 +190,16 @@ def ingest(kb_dir: Path, path: Path) -> int:
     return len(chunks)
 
 
-def search(conn, query: str, kind: str | None, limit: int, mode: Mode = "hybrid") -> list[KnowledgeChunk]:
+def search(conn, query: str, kind: str | None, limit: int, mode: Mode = "rerank") -> list[KnowledgeChunk]:
     """The `limit` most relevant chunks for `query`, best first; `kind` filters guide/incident.
 
-    `mode` exists for the eval (comparing retrievers); the MCP tools always use "hybrid".
+    The MCP tools use the default, "rerank" (best in `fleet-eval`: hit@1 0.95 vs 0.82 for
+    hybrid, for ~250 ms more per search).  The other modes exist to compare them in the eval.
     """
     rankings = []  # one list of chunk ids per retriever, best first
-    if mode in ("vector", "hybrid"):
+    if mode in ("vector", "hybrid", "rerank"):
         rankings.append(_vector_ranking(conn, query, kind))
-    if mode in ("keyword", "hybrid"):
+    if mode in ("keyword", "hybrid", "rerank"):
         rankings.append(_keyword_ranking(conn, query, kind))
 
     # Reciprocal Rank Fusion: only the RANK in each list counts, not the raw scores.
@@ -196,16 +209,42 @@ def search(conn, query: str, kind: str | None, limit: int, mode: Mode = "hybrid"
     for ranking in rankings:
         for rank, chunk_id in enumerate(ranking, start=1):
             scores[chunk_id] += 1 / (RRF_K + rank)
-    best = sorted(scores, key=scores.__getitem__, reverse=True)[:limit]
+    # The reranker gets all CANDIDATES to re-order; otherwise we only need the top `limit`.
+    best = sorted(scores, key=scores.__getitem__, reverse=True)[: CANDIDATES if mode == "rerank" else limit]
 
     rows = conn.execute(
         f"SELECT id, source, kind, title, section, text FROM chunks WHERE id IN ({','.join('?' * len(best))})",
         best,  # the placeholders are generated, the values are bound: no user text in the SQL
     ).fetchall()
     by_id = {r["id"]: r for r in rows}
+
+    if mode == "rerank" and best:
+        # Replace the fusion scores with the reranker's and re-sort by them.
+        scores = _rerank_scores(query, {i: by_id[i]["text"] for i in best})
+        best = sorted(best, key=scores.__getitem__, reverse=True)[:limit]
+
     return [
         KnowledgeChunk(**{k: by_id[i][k] for k in Chunk._fields}, score=round(scores[i], 4)) for i in best
     ]
+
+
+@cache  # load the model once per process, not on every search
+def _reranker():
+    # Imported here, not at the top: only the rerank mode needs onnxruntime, and loading
+    # it costs time on every `fleet-mcp` / `fleet-chat` start otherwise.
+    from flashrank import Ranker
+
+    return Ranker(model_name=RERANK_MODEL, cache_dir=str(MODELS_DIR), log_level="WARNING")
+
+
+def _rerank_scores(query: str, texts: dict[int, str]) -> dict[int, float]:
+    """Cross-encoder relevance of each chunk text to `query`, by chunk id (higher = better)."""
+    from flashrank import RerankRequest
+
+    passages = [{"id": i, "text": text} for i, text in texts.items()]
+    return {
+        r["id"]: float(r["score"]) for r in _reranker().rerank(RerankRequest(query=query, passages=passages))
+    }
 
 
 def _vector_ranking(conn, query: str, kind: str | None) -> list[int]:
@@ -246,4 +285,5 @@ def _keyword_ranking(conn, query: str, kind: str | None) -> list[int]:
 
 def main() -> None:
     n = ingest(KB_DIR, KB_PATH)
+    _reranker()  # download the reranker model now (setup), not during the first search
     print(f"Indexed {n} chunks from {KB_DIR} into {KB_PATH} ({EMBED_MODEL})")

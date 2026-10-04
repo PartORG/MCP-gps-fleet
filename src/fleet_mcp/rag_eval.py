@@ -24,7 +24,7 @@ from pathlib import Path
 from fleet_mcp import rag
 
 QUESTIONS = rag.ROOT / "tests" / "eval_questions.json"
-MODES: tuple[rag.Mode, ...] = ("vector", "keyword", "hybrid")
+MODES: tuple[rag.Mode, ...] = ("vector", "keyword", "hybrid", "rerank")
 DEPTH = 10  # look this deep for the rank; deeper misses count as "not found"
 
 
@@ -56,7 +56,7 @@ def main() -> None:
 
     # Per-question ranks show WHERE the modes differ, e.g. identifiers vs paraphrases.
     print(f"\nrank of the expected document per question (- = not in top {DEPTH}):")
-    print(f"{'vec':>4}{'key':>4}{'hyb':>4}  question")
+    print(f"{'vec':>4}{'key':>4}{'hyb':>4}{'rr':>4}  question")
     for i, q in enumerate(questions):
         cells = "".join(f"{results[m][i] or '-':>4}" for m in MODES)
         print(f"{cells}  {q['question']}")

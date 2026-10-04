@@ -21,7 +21,8 @@ comes from the knowledge base in `kb/`.
 uv sync
 ollama pull nomic-embed-text   # local embedding model (once); Ollama must be running
 uv run fleet-seed              # (re)creates data/fleet.db, ~10k telemetry rows ending "now"
-uv run fleet-ingest            # indexes kb/*.md into data/kb.db (re-run after editing kb/)
+uv run fleet-ingest            # indexes kb/*.md into data/kb.db (re-run after editing kb/);
+                               # first run also downloads the reranker model (~22 MB)
 uv run fleet-eval              # retrieval quality per search mode (see "Search quality")
 uv run pytest                  # RAG tests are skipped if Ollama is not running
 ```
@@ -83,11 +84,15 @@ npx @modelcontextprotocol/inspector uv run fleet-mcp   # MCP Inspector in the br
 
 ## Search quality
 
-The knowledge-base search is **hybrid**: a vector search (meaning, via Ollama
-embeddings + sqlite-vec) and a keyword search (SQLite FTS5, BM25) each return 20
-candidates, and Reciprocal Rank Fusion merges the two rankings.  Vectors handle
-paraphrases, keywords handle exact tokens like plates, incident numbers and
-"561/2006".
+The knowledge-base search runs in three stages:
+
+1. **Two retrievers**, 20 candidates each: vector search (meaning, via Ollama
+   embeddings + sqlite-vec) and keyword search (SQLite FTS5, BM25).  Vectors handle
+   paraphrases, keywords handle exact tokens like plates, incident numbers, "561/2006".
+2. **Fusion** of the two rankings with Reciprocal Rank Fusion -> top 20.
+3. **Reranking** of those 20 by a small cross-encoder (flashrank, MiniLM-L-12, CPU,
+   no PyTorch), which reads the question and each chunk together.  Its 0..1 score
+   also tells the LLM when nothing relevant was found (all scores near 0).
 
 `uv run fleet-eval` scores every mode on the 22 questions in
 `tests/eval_questions.json` (written before tuning, in user words) and prints the
@@ -97,11 +102,14 @@ rank of the right document per question.  Current results:
 |---|---|---|---|---|
 | vector (v2) | 0.82 | 0.91 | 0.95 | 0.87 |
 | keyword | 0.82 | 0.95 | 1.00 | 0.90 |
-| **hybrid** (used by the tools) | 0.82 | **1.00** | 1.00 | **0.91** |
+| hybrid | 0.82 | 1.00 | 1.00 | 0.91 |
+| **rerank** (used by the tools) | **0.95** | 1.00 | 1.00 | **0.98** |
 
 hit@k = share of questions with the right document in the top k; MRR = mean of
 1/rank.  With 22 questions one question is ~4.5 points, so read these as a
-direction.  `pytest` fails if hybrid drops below hit@3 0.95 or below vector MRR.
+direction.  Reranking costs ~250 ms per search (hybrid alone: ~30 ms), small next to
+an LLM tool call.  `pytest` fails if the rerank mode drops below hit@1 0.9 / hit@3
+0.95, or if any stage ranks worse than the one before it.
 
 ## Layout
 
@@ -111,7 +119,7 @@ direction.  `pytest` fails if hybrid drops below hit@3 0.95 or below vector MRR.
 | `src/fleet_mcp/seed.py` | Synthetic data generator + anomaly injection |
 | `src/fleet_mcp/db.py` | Read-only connection and every SQL query |
 | `src/fleet_mcp/models.py` | Pydantic models = the tools' output schemas |
-| `src/fleet_mcp/rag.py` | Chunking, Ollama embeddings, vector + FTS5 index, hybrid search |
+| `src/fleet_mcp/rag.py` | Chunking, Ollama embeddings, vector + FTS5 index, hybrid search, reranking |
 | `src/fleet_mcp/rag_eval.py` | Retrieval eval (`fleet-eval`) |
 | `tests/eval_questions.json` | Eval questions with their expected documents |
 | `src/fleet_mcp/server.py` | The MCP tools |
@@ -137,4 +145,4 @@ direction.  `pytest` fails if hybrid drops below hit@3 0.95 or below vector MRR.
 ## Roadmap
 
 v1 database + tools → v1.5 stdio/HTTP transports → v2 RAG over `kb/` → v3 Pydantic AI offline client
-(qwen3:8b) → v4 hybrid search + eval (this) → v5 flashrank reranking → v6 deployment (auth, Docker, health probes).
+(qwen3:8b) → v4 hybrid search + eval → v5 flashrank reranking (this) → v6 deployment (auth, Docker, health probes).
