@@ -60,7 +60,11 @@ INSTRUCTIONS = (
 )
 
 
-def build_agent() -> Agent:
+def build_agent(model_name: str = CHAT_MODEL, extra_instructions: str = "") -> Agent:
+    """The fleet agent: a local Ollama model + our MCP server as its toolset.
+
+    The parameters exist for the model comparison in agent_eval.py; fleet-chat uses the defaults.
+    """
     headers = None
     if url := os.environ.get("FLEET_MCP_URL"):
         transport = url  # MCPToolset builds a Streamable HTTP client from a URL
@@ -83,8 +87,8 @@ def build_agent() -> Agent:
     # the model. Off by default in Pydantic AI; Claude Code always reads them.
     fleet = MCPToolset(transport, include_instructions=True, headers=headers)
     # Ollama speaks the OpenAI chat API under /v1, which is what OllamaModel talks to.
-    model = OllamaModel(CHAT_MODEL, provider=OllamaProvider(base_url=f"{OLLAMA_URL}/v1"))
-    return Agent(model, toolsets=[fleet], instructions=INSTRUCTIONS)
+    model = OllamaModel(model_name, provider=OllamaProvider(base_url=f"{OLLAMA_URL}/v1"))
+    return Agent(model, toolsets=[fleet], instructions=INSTRUCTIONS + extra_instructions)
 
 
 async def ask(agent: Agent, question: str, history: list) -> list:

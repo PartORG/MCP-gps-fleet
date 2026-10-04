@@ -21,6 +21,7 @@ fleet-seed = "fleet_mcp.seed:main"
 fleet-ingest = "fleet_mcp.rag:main"
 fleet-chat = "fleet_mcp.chat:main"
 fleet-eval = "fleet_mcp.rag_eval:main"
+fleet-agent-eval = "fleet_mcp.agent_eval:main"
 
 [build-system]
 requires = ["uv_build>=0.12.17,<0.13.0"]

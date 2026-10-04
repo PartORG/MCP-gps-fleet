@@ -24,6 +24,7 @@ uv run fleet-ingest            # indexes kb/*.md into data/kb.db (re-run after e
                                # Ollama must be running; the first run pulls the embedding
                                # model into it and downloads the reranker model (~22 MB)
 uv run fleet-eval              # retrieval quality per search mode (see "Search quality")
+uv run fleet-agent-eval        # chat models compared end to end (see "Chat model comparison")
 uv run pytest                  # RAG tests are skipped if Ollama is not running
 ```
 
@@ -84,6 +85,21 @@ claude mcp add --transport http fleet-http http://127.0.0.1:8000/mcp
 ```bash
 npx @modelcontextprotocol/inspector uv run fleet-mcp   # MCP Inspector in the browser (needs Node)
 ```
+
+## Chat model comparison
+
+`uv run fleet-agent-eval` runs the same agent as `fleet-chat` with several local
+models (qwen3:8b, qwen3:8b with thinking off, qwen3:4b, llama3.2:3b, all with the
+same 12k context) on 6 questions, and checks each answer:
+
+- **tools**: the model called the tools the question needs;
+- **facts**: the answer contains the expected facts, computed from `fleet.db` at
+  eval time (e.g. the plates of the vehicles offline right now);
+- **invented**: plates in the answer that appear in no tool result, i.e. made up.
+
+A run passes with all three.  Missing model variants are created automatically
+(`ollama pull` the base model first, e.g. `ollama pull qwen3:4b`).  Pass variant
+names to run a subset: `uv run fleet-agent-eval qwen3:4b llama3.2:3b`.
 
 ## Deployment
 
@@ -162,6 +178,7 @@ an LLM tool call.  `pytest` fails if the rerank mode drops below hit@1 0.9 / hit
 | `src/fleet_mcp/models.py` | Pydantic models = the tools' output schemas |
 | `src/fleet_mcp/rag.py` | Chunking, Ollama embeddings, vector + FTS5 index, hybrid search, reranking |
 | `src/fleet_mcp/rag_eval.py` | Retrieval eval (`fleet-eval`) |
+| `src/fleet_mcp/agent_eval.py` | Chat model comparison (`fleet-agent-eval`) |
 | `tests/eval_questions.json` | Eval questions with their expected documents |
 | `src/fleet_mcp/server.py` | The MCP tools |
 | `src/fleet_mcp/chat.py` | Offline Pydantic AI client (`fleet-chat`) |
@@ -189,4 +206,4 @@ an LLM tool call.  `pytest` fails if the rerank mode drops below hit@1 0.9 / hit
 ## Roadmap
 
 v1 database + tools → v1.5 stdio/HTTP transports → v2 RAG over `kb/` → v3 Pydantic AI offline client
-(qwen3:8b) → v4 hybrid search + eval → v5 flashrank reranking → v6 deployment: auth, Docker, Helm, CI (this).
+(qwen3:8b) → v4 hybrid search + eval → v4.5 chat model eval → v5 flashrank reranking → v6 deployment: auth, Docker, Helm, CI (this).
